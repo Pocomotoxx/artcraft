@@ -1,0 +1,190 @@
+import { analysisTaskPriorityRank, normalizeAnalysisPriority } from "./analysis-tasks.js";
+import { ANALYSIS_RETRY_POLICY, createAnalysisRequestBudget, analysisRequestCounts } from "./analysis-retry-policy.js";
+
+const schedulers = new Map();
+const inFlight = new Map();
+const RETRYABLE_STATUSES = new Set([0, 408, 429, 500, 502, 503, 504]);
+const SHARED_QUEUE_AGING_MS = 30_000;
+
+export function scheduleAnalysis(keyValue, concurrencyValue, task, options = {}) {
+  const key = String(keyValue ?? "").trim();
+  if (!key || typeof task !== "function") throw new Error("分析调度参数无效");
+  const concurrency = normalizedConcurrency(concurrencyValue);
+  const state = schedulers.get(key) ?? {
+    active: 0,
+    limit: concurrency,
+    effectiveLimit: concurrency,
+    queue: [],
+    activeItems: new Set(),
+    nextSequence: 0,
+    throttledUntil: 0
+  };
+  state.activeItems ??= new Set();
+  if (!schedulers.has(key)) schedulers.set(key, state);
+  return new Promise((resolve, reject) => {
+    state.queue.push({
+      task,
+      resolve,
+      reject,
+      concurrency,
+      priority: normalizeAnalysisPriority(options.priority),
+      enqueuedAt: Date.now(),
+      sequence: state.nextSequence++
+    });
+    synchronizeLimit(state);
+    drain(state);
+  });
+}
+
+export function coalesceAnalysisRequest(keyValue, task, options = {}) {
+  const key = String(keyValue ?? "").trim();
+  options.signal?.throwIfAborted();
+  if (!key) return task(options.signal);
+  let shared = inFlight.get(key);
+  if (shared) options.onCoalesced?.();
+  else {
+    shared = { controller: new AbortController(), consumers: 0, promise: null };
+    shared.promise = Promise.resolve().then(() => {
+      shared.controller.signal.throwIfAborted();
+      return task(shared.controller.signal);
+    }).finally(() => {
+      if (inFlight.get(key) === shared) inFlight.delete(key);
+    });
+    inFlight.set(key, shared);
+  }
+  shared.consumers++;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", abort);
+      shared.consumers--;
+      callback(value);
+    };
+    const abort = () => {
+      settle(reject, options.signal.reason ?? new DOMException("已停止", "AbortError"));
+      if (!shared.consumers) {
+        shared.controller.abort(options.signal.reason);
+        if (inFlight.get(key) === shared) inFlight.delete(key);
+      }
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    shared.promise.then(value => settle(resolve, value), error => settle(reject, error));
+  });
+}
+
+export async function runScheduledAnalysisWithRetries(options = {}) {
+  const wait = options.wait ?? defaultWait;
+  const jitter = options.jitter ?? (() => Math.floor(Math.random() * 501));
+  const requestBudget = options.requestBudget ?? createAnalysisRequestBudget();
+  let retries = 0;
+  for (;;) {
+    try {
+      options.signal?.throwIfAborted();
+      return await scheduleAnalysis(options.key, options.concurrency, () => {
+        options.signal?.throwIfAborted();
+        return options.task(requestBudget);
+      }, {
+        priority: options.priority
+      });
+    } catch (error) {
+      error.attempts = analysisRequestCounts(requestBudget);
+      if (!isRetryable(error) || retries >= ANALYSIS_RETRY_POLICY.serviceRetries || requestBudget.providerCalls >= requestBudget.maxProviderCalls) throw error;
+      const retryAfter = Number(error?.retryAfterMs) || 0;
+      const delay = retryAfter || ANALYSIS_RETRY_POLICY.backoffMs[retries] + Math.max(0, Number(jitter()) || 0);
+      retries += 1;
+      await interruptibleWait(wait, delay, options.signal);
+    }
+  }
+}
+
+function drain(state) {
+  synchronizeLimit(state);
+  while (state.active < state.effectiveLimit && state.queue.length) {
+    const item = nextSharedItem(state);
+    if (!item) return;
+    state.active += 1;
+    state.activeItems.add(item);
+    Promise.resolve().then(item.task).then((value) => {
+      if (state.throttledUntil && Date.now() >= state.throttledUntil) {
+        state.effectiveLimit = Math.min(state.limit, state.effectiveLimit + 1);
+        if (state.effectiveLimit === state.limit) state.throttledUntil = 0;
+      }
+      item.resolve(value);
+    }, (error) => {
+      if ([429, 503].includes(Number(error?.status))) {
+        state.effectiveLimit = Math.max(1, Math.floor(state.effectiveLimit / 2));
+        state.throttledUntil = Date.now() + 30_000;
+      }
+      item.reject(error);
+    }).finally(() => {
+      state.active -= 1;
+      state.activeItems.delete(item);
+      synchronizeLimit(state);
+      drain(state);
+    });
+  }
+}
+
+function nextSharedItem(state) {
+  let bestIndex = -1;
+  let bestScore = Infinity;
+  let bestSequence = Infinity;
+  const now = Date.now();
+  for (let index = 0; index < state.queue.length; index += 1) {
+    const item = state.queue[index];
+    const score = analysisPriorityScore(item.priority, now - item.enqueuedAt, SHARED_QUEUE_AGING_MS);
+    if (score < bestScore || (score === bestScore && item.sequence < bestSequence)) {
+      bestIndex = index;
+      bestScore = score;
+      bestSequence = item.sequence;
+    }
+  }
+  if (bestIndex < 0) return null;
+  return state.queue.splice(bestIndex, 1)[0];
+}
+
+function analysisPriorityScore(priority, waitMs, agingMs) {
+  const rank = analysisTaskPriorityRank(priority);
+  return rank - Math.floor(Math.max(0, waitMs) / agingMs);
+}
+
+function synchronizeLimit(state) {
+  const requestedLimits = [...state.activeItems, ...state.queue].map((item) => item.concurrency);
+  if (requestedLimits.length) state.limit = Math.min(...requestedLimits);
+  state.effectiveLimit = state.throttledUntil
+    ? Math.min(state.effectiveLimit, state.limit)
+    : state.limit;
+}
+
+function isRetryable(error) {
+  if (error?.recovery) return error.recovery === "retry";
+  if (error?.status === undefined || error?.status === null) return false;
+  const status = Number(error.status) || 0;
+  return error?.name !== "AbortError" && ![0, 408].includes(status) && RETRYABLE_STATUSES.has(status);
+}
+
+async function interruptibleWait(wait, delay, signal) {
+  signal?.throwIfAborted();
+  if (!signal) return wait(delay);
+  let stop;
+  const aborted = new Promise((_, reject) => { stop = () => reject(signal.reason ?? abortError()); signal.addEventListener("abort", stop, { once: true }); });
+  try { await Promise.race([wait(delay), aborted]); }
+  finally { signal.removeEventListener("abort", stop); }
+}
+
+function normalizedConcurrency(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 2 ? number : 2;
+}
+
+function defaultWait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function abortError() {
+  const error = new Error("分析任务已取消");
+  error.name = "AbortError";
+  return error;
+}

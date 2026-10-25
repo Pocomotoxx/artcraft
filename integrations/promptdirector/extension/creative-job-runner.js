@@ -1,0 +1,343 @@
+import { readImageGenerationInfo } from "./image-generation-info.js";
+import { applyLibraryToolEvent, settleLibraryToolEvents } from "./composer-library-tools.js";
+import { createLocalComposerLibraryTools } from "./composer-library-host.js";
+import {
+  appendDiagnosticEvent,
+  completeComposerAssemblySnapshot,
+  createComposerSession,
+  normalizeComposerSettings
+} from "./composer.js";
+import {
+  ComposerServiceError,
+  executeComposerTurnWithService,
+  selectedComposerService
+} from "./composer-service.js";
+import { applyComposerServiceResult } from "./composer-turn-core.js";
+import { normalizeAiSettings } from "./deepseek.js";
+import { deleteScreenshotBlob, getScreenshotBlob, saveScreenshotBlob } from "./image-store.js";
+import { readImageDimensions } from "./image-metadata.js";
+import { deleteMediaBlob, getMediaBlob, saveDerivedMedia, saveMediaBlob } from "./media-store.js";
+import { prepareLocalMedia } from "./local-media.js";
+import { assertImageDimensions } from "./resource-limits.js";
+import { blobToDataUrl, normalizeVisionSettings } from "./vision.js";
+import { normalizeAiServiceProfiles } from "./ai-service-profiles.js";
+import { prepareComposerVideos, sessionHasVideoReferences } from "./composer-video-references.js";
+import { createComposerActiveTurn, updateComposerActiveTurn, createLatestCheckpointWriter } from "./composer-active-turn.js";
+
+export async function runCreativeJob(job, context = {}) {
+  const signal = context.signal;
+  const stored = await context.loadState();
+  const profiles = normalizeAiServiceProfiles(stored.aiServiceProfiles);
+  const settings = {
+    ai: normalizeAiSettings(stored.aiSettings),
+    vision: {
+      ...normalizeVisionSettings(stored.visionSettings),
+      xai: profiles.xai,
+      providerProfiles: stored.visionSettings?.providerProfiles
+    }
+  };
+  const composerSettings = normalizeComposerSettings(stored.composerSettings);
+  let session = createComposerSession(job.request.session);
+  const videoDialogue = sessionHasVideoReferences(session) && !["create_image", "create_video"].includes(session.outputMode);
+  if (videoDialogue) {
+    const service = selectedComposerService(session.aiProfile, settings.ai, settings.vision);
+    session = createComposerSession({ ...session, activeTurn: createComposerActiveTurn({
+      turnId: job.id,
+      userMessageId: job.userMessageId,
+      route: session.currentRoute || "auto",
+      routeSource: session.currentRouteSource,
+      serviceId: service.serviceId,
+      model: service.model
+    }) });
+  }
+  const checkpoints = createLatestCheckpointWriter((snapshot) => context.progress({
+    phase: "generation", session: snapshot, providerMayHaveAccepted: snapshot.activeTurn?.providerMayHaveAccepted === true
+  }));
+  let checkpointError;
+  const savedIds = [];
+  const actualStages = [];
+  const recordStage = (value) => {
+    const stage = String(value ?? "").trim();
+    if (stage && !actualStages.includes(stage)) actualStages.push(stage);
+  };
+  try {
+    if (!job.remoteVideo || job.phase === "generation") {
+      await context.progress({ phase: "generation", session, actualStages: [...actualStages] });
+    }
+    const route = session.currentRoute || (videoDialogue ? "auto" : "compose");
+    const instruction = session.currentInstruction || latestUserMessage(session);
+    session = appendDiagnosticEvent(session, {
+      phase: "streaming",
+      status: "started",
+      detail: session.outputMode === "create_image"
+        ? "正在创建图片"
+        : session.outputMode === "create_video" ? "正在创建视频" : "正在生成"
+    });
+    const executionSession = createComposerSession(session);
+    recordStage("preparing_media");
+    await context.progress({ phase: "generation", session, actualStages: [...actualStages] });
+    const preparedImages = session.imageReferenceMode === "text_only" ? [] : await prepareReferenceImages(executionSession);
+    const preparedVideos = await prepareComposerVideos(executionSession, { signal });
+    const imageEdit = await prepareImageEdit(job.request.imageEdit);
+    recordStage("media_prepared");
+    await context.progress({ phase: "generation", session, actualStages: [...actualStages] });
+    let phaseQueue = Promise.resolve();
+    let providerMayHaveAccepted = job.providerMayHaveAccepted === true || Boolean(job.remoteVideo);
+    let pendingImageIds = preparedImages.map(image => image.visualId);
+    const markProviderRequestStarted = async () => {
+      session = createComposerSession({ ...session, libraryTools: { ...session.libraryTools, requestCount: session.libraryTools.requestCount + 1, imageIds: [...new Set([...session.libraryTools.imageIds, ...pendingImageIds])] } });
+      pendingImageIds = [];
+      providerMayHaveAccepted = true;
+      if (session.activeTurn) session = createComposerSession({ ...session, activeTurn: updateComposerActiveTurn(session.activeTurn, {
+        status: "waiting", phase: "waiting", providerMayHaveAccepted: true
+      }) });
+      recordStage("provider_request");
+      try {
+        await context.progress({
+          phase: "generation",
+          session,
+          providerMayHaveAccepted: true,
+          actualStages: [...actualStages]
+        });
+      } catch (error) {
+        session = appendDiagnosticEvent(session, {
+          phase: "generation",
+          status: "checkpoint_failed",
+          detail: `服务请求已经发出，但本地状态检查点保存失败：${error.message || "存储不可用"}`
+        });
+      }
+    };
+    const toolRuntime = createLocalComposerLibraryTools({
+      session, vision: session.imageReferenceMode !== "text_only",
+      onEvent: async event => {
+        signal?.throwIfAborted();
+        if (event.status === "completed" && event.imageIds) pendingImageIds.push(...event.imageIds);
+        session = createComposerSession(applyLibraryToolEvent(session, event));
+        await context.progress({ phase: "generation", session, actualStages: [...actualStages] });
+      },
+      onRequest: async ({ usage, requestCount }) => { await checkpoints.drain(); session = createComposerSession({ ...session, libraryTools: { ...session.libraryTools, usage, usageRequestCount: requestCount } }); }
+    });
+    const result = await executeComposerTurnWithService({
+      session: executionSession,
+      userMessage: "",
+      composerSettings,
+      route,
+      instruction,
+      imageEdit
+    }, settings, preparedImages, {
+      signal,
+      toolRuntime,
+      stream: videoDialogue,
+      preparedVideos,
+      onDelta: videoDialogue ? (_delta, content) => {
+        recordStage("receiving_text");
+        session = createComposerSession({ ...session, activeTurn: updateComposerActiveTurn(session.activeTurn, {
+          status: "receiving", phase: "streaming", partialText: content, updatedAt: new Date().toISOString()
+        }) });
+        checkpoints.schedule(session).catch((error) => { checkpointError = error; });
+      } : undefined,
+      onPhase: (phase) => {
+        recordStage(phase);
+        const stages = [...actualStages];
+        phaseQueue = phaseQueue.then(() => context.progress({ phase, session, actualStages: stages }));
+      },
+      onRequestStart: markProviderRequestStarted,
+      remoteVideo: job.remoteVideo,
+      onRemoteVideo: (remoteVideo) => {
+        const stages = [...actualStages];
+        phaseQueue = phaseQueue.then(() => context.progress({
+          phase: "generation",
+          session,
+          remoteVideo,
+          actualStages: stages
+        }));
+      },
+      pollIntervalMs: context.pollIntervalMs
+    });
+    await phaseQueue;
+    await checkpoints.drain();
+    if (checkpointError) throw checkpointError;
+    signal?.throwIfAborted();
+    session = appendDiagnosticEvent(session, {
+      phase: "streaming",
+      status: "completed",
+      detail: `输入 ${result.usage.promptTokens} / 输出 ${result.usage.completionTokens} tokens`
+    });
+    session = createComposerSession({ ...applyComposerServiceResult(session, result, composerSettings, route, instruction), activeTurn: null });
+
+    if (!["image", "video"].includes(result.kind)) {
+      session = createComposerSession({
+        ...session,
+        assemblySnapshot: completeComposerAssemblySnapshot(session.assemblySnapshot, { ...result, actualStages, libraryTools: session.libraryTools, retrievedSources: session.retrievedSources })
+      });
+      return { session, visuals: [], generation: null };
+    }
+    recordStage("persisting");
+    await context.progress({ phase: "persisting", session, actualStages: [...actualStages] });
+    const visuals = [];
+    for (const item of result.images ?? []) {
+      const blob = item?.blob;
+      if (!(blob instanceof Blob) || !blob.type.startsWith("image/") || !blob.size) {
+        throw new Error("生图服务没有返回有效图片");
+      }
+      const { width, height } = await readImageDimensions(blob);
+      assertImageDimensions(width, height);
+      const id = globalThis.crypto.randomUUID();
+      await saveScreenshotBlob(id, blob);
+      savedIds.push(id);
+      const generationInfo = await readImageGenerationInfo(blob, { signal });
+      visuals.push({
+        ...(generationInfo ? { generationInfo } : {}),
+        id,
+        kind: "image",
+        usage: "content",
+        storageMode: "managed",
+        mimeType: blob.type,
+        width,
+        height,
+        byteSize: blob.size,
+        capturedAt: new Date().toISOString(),
+        reviewStatus: "unverified"
+      });
+    }
+    for (const item of result.videos ?? []) {
+      const blob = item?.blob;
+      if (!(blob instanceof Blob) || !blob.type.startsWith("video/") || !blob.size) throw new Error("视频服务没有返回有效视频");
+      const id = globalThis.crypto.randomUUID();
+      const extension = blob.type === "video/webm" ? "webm" : "mp4";
+      const file = new File([blob], `generated-video.${extension}`, { type: blob.type });
+      const prepared = await prepareLocalMedia(file, id, {
+        relativePath: file.name,
+        readVideoMedia: readGeneratedVideoMedia
+      });
+      await saveMediaBlob(id, prepared.blob);
+      savedIds.push(id);
+      if (prepared.poster?.blob instanceof Blob) {
+        await saveDerivedMedia(id, { thumbnail: prepared.poster.blob });
+      }
+      visuals.push({ ...prepared.asset, reviewStatus: "unverified" });
+    }
+    if (!visuals.length) throw new Error(result.kind === "video" ? "视频服务没有返回视频" : "生图服务没有返回图片");
+    recordStage("persisted");
+    await context.progress({ phase: "persisting", session, actualStages: [...actualStages] });
+    session = createComposerSession({
+      ...session,
+      assemblySnapshot: completeComposerAssemblySnapshot(session.assemblySnapshot, { ...result, actualStages, libraryTools: session.libraryTools, retrievedSources: session.retrievedSources })
+    });
+    return {
+      session,
+      visuals,
+      generation: {
+        parentVisualId: job.request.imageEdit?.parentVisualId,
+        editMode: job.request.imageEdit?.mode,
+        serviceId: result.serviceId,
+        requestModel: result.requestModel,
+        responseModel: result.model,
+        requestParameters: result.requestParameters,
+        usage: result.providerUsage || result.usage,
+        cost: result.cost,
+        routing: result.routing,
+        modification: job.request.imageEdit?.modification
+      }
+    };
+  } catch (error) {
+    await checkpoints.drain().catch(() => undefined);
+    await Promise.allSettled(savedIds.flatMap((id) => [deleteScreenshotBlob(id), deleteMediaBlob(id)]));
+    session = createComposerSession({ ...session, libraryTools: settleLibraryToolEvents(session.libraryTools, job.userMessageId, error.message) });
+    await context.progress({ phase: "generation", session, actualStages: [...actualStages] }).catch(() => undefined);
+    error.actualStages = [...actualStages];
+    throw error;
+  }
+}
+
+function readGeneratedVideoMedia(blob, _mimeType, videoAssetId) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement("video");
+    const url = URL.createObjectURL(blob);
+    const finish = (value, error) => {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      URL.revokeObjectURL(url);
+      if (error) reject(error); else resolve(value);
+    };
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.onloadeddata = () => {
+      try {
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d").drawImage(video, 0, 0, width, height);
+        canvas.toBlob((posterBlob) => {
+          const metadata = {
+            width,
+            height,
+            durationMs: Math.max(1, Math.round(video.duration * 1000)),
+            playbackCapability: "native"
+          };
+          if (!posterBlob) return finish({ metadata });
+          finish({
+            metadata,
+            poster: {
+              blob: posterBlob,
+              asset: {
+                id: `poster:${videoAssetId}`,
+                kind: "image",
+                usage: "poster",
+                derivedFromAssetId: videoAssetId,
+                storageMode: "managed",
+                mimeType: posterBlob.type,
+                byteSize: posterBlob.size,
+                width,
+                height,
+                capturedAt: new Date().toISOString(),
+                reviewStatus: "verified"
+              }
+            }
+          });
+        }, "image/webp", .82);
+      } catch (error) {
+        finish(null, error);
+      }
+    };
+    video.onerror = () => finish(null, new Error("生成视频无法在当前浏览器中读取"));
+    video.src = url;
+  });
+}
+
+async function prepareReferenceImages(session) {
+  const refs = [...new Map(session.referenceSnapshots
+    .flatMap((reference) => reference.imageRefs)
+    .map((item) => [item.visualId, item])).values()];
+  return Promise.all(refs.map(async (imageRef) => {
+    const blob = await getMediaBlob(imageRef.visualId) ?? await getScreenshotBlob(imageRef.visualId);
+    if (!blob) throw new ComposerServiceError("有一张手选内容图已不存在，本次没有发送不完整参考", 422, { retryable: true });
+    return { visualId: imageRef.visualId, mimeType: blob.type, dataUrl: await blobToDataUrl(blob) };
+  }));
+}
+
+async function prepareImageEdit(value) {
+  if (!value) return null;
+  const baseBlob = await getScreenshotBlob(value.parentVisualId);
+  if (!baseBlob) throw new ComposerServiceError("当前结果底图已经不存在", 422, { retryable: false });
+  const maskBlob = value.mode === "local" ? await getScreenshotBlob(value.maskAssetId) : null;
+  if (value.mode === "local" && !maskBlob) {
+    throw new ComposerServiceError("局部修改遮罩已经不存在", 422, { retryable: false });
+  }
+  return {
+    mode: value.mode,
+    parentVisualId: value.parentVisualId,
+    originalPrompt: value.originalPrompt,
+    modification: value.modification,
+    baseImage: { visualId: value.parentVisualId, dataUrl: await blobToDataUrl(baseBlob) },
+    mask: maskBlob ? { dataUrl: await blobToDataUrl(maskBlob) } : null
+  };
+}
+
+function latestUserMessage(session) {
+  return [...session.messages].reverse().find((item) => item.role === "user")?.content || "";
+}

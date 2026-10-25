@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN" data-i18n-title="创作 Skill 中心">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title data-i18n="创作 Skill 中心">创作 Skill 中心</title>
+    <script src="theme-bootstrap.js"></script>
+    <link rel="stylesheet" href="ui-foundation.css" />
+    <link rel="stylesheet" href="library.css" />
+    <link rel="stylesheet" href="skills-page.css" />
+    <link rel="stylesheet" href="skill-file-browser.css" />
+    <link rel="stylesheet" href="skill-cover.css" />
+    <link rel="stylesheet" href="source-video-preview.css" />
+</head>
+  <body class="skills-page" data-skill-view="list">
+    <header class="skills-topbar">
+      <a class="skills-brand product-brand" href="library.html" aria-label="返回视觉创作灵感库" data-i18n-aria-label="返回视觉创作灵感库" title="返回视觉创作灵感库" data-i18n-title="返回视觉创作灵感库"><img class="product-brand-mark" src="assets/icons/icon-source.svg" alt="" /><span class="product-brand-copy"><strong class="product-brand-name">PromptDirector</strong><span class="product-brand-tagline" data-i18n="视觉创作灵感库">视觉创作灵感库</span></span></a>
+      <label class="skills-search"><span class="sr-only" data-i18n="搜索 Skill">搜索 Skill</span><input id="skill-search" type="search" placeholder="搜索调用名或说明" data-i18n-placeholder="搜索调用名或说明" /></label>
+      <div class="skills-top-actions">
+        <button id="skill-context-back" class="button-secondary skill-context-back" type="button" aria-label="返回案例库" title="返回案例库" data-i18n-aria-label="返回案例库" data-i18n-title="返回案例库"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="assets/ui-icons.svg#icon-arrow-left"></use></svg><span data-i18n="返回案例库">返回案例库</span></button>
+      </div>
+      <input id="skill-zip-file" class="sr-only" type="file" accept=".zip,.skill,.md,application/zip,text/markdown" />
+      <input id="skill-folder-files" class="sr-only" type="file" webkitdirectory multiple />
+    </header>
+
+    <main class="skills-main">
+      <section id="skill-library" class="skill-library">
+        <div class="skills-heading"><div><h1 data-i18n="创作 Skill 中心">创作 Skill 中心</h1><p id="skill-summary"></p></div><div class="skills-heading-actions"><a class="button-secondary" href="curated-skills.html" data-i18n="精选 Skill">精选 Skill</a><button id="skill-import" class="button-secondary" type="button" data-i18n="导入">导入</button><button id="skill-create" type="button" data-i18n="新建 Skill">新建 Skill</button></div></div>
+        <p id="skill-feedback" class="skill-feedback ui-task-feedback" role="status"></p>
+        <div id="skill-list" class="skill-grid"></div>
+        <div id="skill-empty" class="skill-empty" hidden><strong data-i18n="还没有创作 Skill">还没有创作 Skill</strong><p data-i18n="从你真正喜欢的案例中，按明确目标提炼一份可重复调用的方法。">从你真正喜欢的案例中，按明确目标提炼一份可重复调用的方法。</p></div>
+      </section>
+
+      <section id="skill-detail" class="skill-detail" hidden>
+        <header class="skill-detail-header">
+          <div><h1 id="skill-detail-title"></h1><code id="skill-detail-call-name"></code></div>
+          <div class="skill-detail-actions">
+            <button id="skill-test" type="button" data-i18n="用此 Skill 创作">用此 Skill 创作</button>
+            <button id="skill-detail-edit" class="button-secondary" type="button" data-i18n="编辑">编辑</button>
+            <details id="skill-detail-download" class="skill-detail-more">
+              <summary data-i18n="下载">下载</summary>
+              <div class="skill-detail-more-panel">
+                <button id="skill-export" class="button-secondary" type="button" data-i18n="下载完整 Skill">下载完整 Skill</button>
+                <button id="skill-download-file" class="button-secondary" type="button" data-i18n="下载当前文件">下载当前文件</button>
+              </div>
+            </details>
+            <details id="skill-detail-more" class="skill-detail-more">
+              <summary data-i18n="更多">更多</summary>
+              <div class="skill-detail-more-panel">
+                <button id="skill-detail-refine" class="button-secondary" type="button" data-i18n="用证据改进 Skill">用证据改进 Skill</button>
+                <button id="skill-submit-curated" class="button-secondary" type="button" data-i18n="投稿到精选 Skill">投稿到精选 Skill</button>
+              </div>
+            </details>
+          </div>
+        </header>
+        <p id="skill-detail-feedback" class="skill-feedback ui-task-feedback" role="status"></p>
+        <p id="skill-detail-description" class="skill-detail-description"></p>
+        <div id="skill-detail-files"></div>
+      </section>
+
+      <section id="skill-workspace" class="skill-workspace" hidden>
+        <header class="skill-workspace-header"><div><p id="skill-workspace-kicker" class="skill-workspace-mode"></p><h1 id="skill-workspace-title" data-i18n="创建创作 Skill">创建创作 Skill</h1></div><button id="skill-delete" class="button-secondary danger-button" type="button" hidden data-i18n="删除">删除</button></header>
+
+        <div id="skill-builder" class="skill-builder">
+
+          <div class="skill-builder-content">
+            <section id="skill-source-step" class="skill-step">
+              <div class="skill-section-heading"><div><small data-i18n="来源">来源</small><strong data-i18n="案例组合">案例组合</strong></div><button id="skill-visible-select" class="button-secondary skill-visible-select" type="button" data-i18n="全选当前结果">全选当前结果</button></div>
+
+          <aside id="skill-source-sidebar" class="skill-source-sidebar skill-filter-row">
+            <span id="skill-selected-count" hidden>0</span>
+            <div><details id="skill-project-picker" class="skill-project-picker"><summary><span id="skill-project-label" data-i18n="全部项目">全部项目</span><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="assets/ui-icons.svg#icon-chevron-down"></use></svg></summary><div id="skill-project-filter" class="skill-project-filter" role="listbox" aria-label="按项目筛选" data-i18n-aria-label="按项目筛选"></div></details></div>
+            <label><input aria-label="搜索案例" data-i18n-aria-label="搜索案例" id="skill-case-search" type="search" placeholder="搜索提示词或标题" data-i18n-placeholder="搜索提示词或标题" /></label>
+            <button class="icon-button" title="清空全部案例" aria-label="清空全部案例" data-i18n-title="清空全部案例" data-i18n-aria-label="清空全部案例" id="skill-clear-selection" type="button" disabled><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="assets/ui-icons.svg#icon-x"></use></svg></button>
+          </aside>
+              <div id="skill-selection-summary" class="skill-selection-summary"></div>
+              <div id="skill-case-scroll" class="skill-case-scroll"><div id="skill-case-grid" class="skill-case-grid"></div><div id="skill-case-load-more" class="skill-case-load-more" hidden aria-hidden="true"></div></div>
+            </section>
+
+            <section id="skill-run-evidence-step" class="skill-step" hidden>
+              <div class="skill-section-heading"><div><small data-i18n="创作实验">创作实验</small><strong data-i18n="选择人工判断证据">选择人工判断证据</strong></div><span id="skill-run-evidence-count">0</span></div>
+              <p class="skill-evidence-note" data-i18n="这里只显示实际应用过当前 Skill 且由你填写了判断的运行；勾选后才会进入本次改进。">这里只显示实际应用过当前 Skill 且由你填写了判断的运行；勾选后才会进入本次改进。</p>
+              <div id="skill-run-evidence-list" class="skill-run-evidence-list"></div>
+            </section>
+
+            <section id="skill-target-step" class="skill-step skill-target-step">
+              <div class="skill-section-heading"><div><small>02</small><strong data-i18n="说明提炼目标">说明提炼目标</strong></div></div>
+              <textarea id="skill-goal" rows="3" placeholder="例如：只提炼这些案例的人物构图与动作节奏" data-i18n-placeholder="例如：只提炼这些案例的人物构图与动作节奏"></textarea>
+              <label class="skill-vision-toggle"><input role="switch" class="ui-switch" id="skill-use-vision" type="checkbox" /><span><strong data-i18n="分析所选图片">分析所选图片</strong><small id="skill-vision-toggle-note"></small></span></label>
+              <div id="skill-vision-preview" class="skill-vision-preview" hidden></div>
+              <details id="skill-advanced" class="skill-advanced">
+                <summary data-i18n="运行设置">运行设置</summary>
+                <div class="skill-advanced-body">
+                  <div class="skill-runtime-grid">
+                    <div><span class="skill-field-label" data-i18n="文字提炼模型">文字提炼模型</span><div id="skill-text-provider-menu" class="skill-option-menu"></div></div>
+                    <div><span class="skill-field-label" data-i18n="图片分析模型">图片分析模型</span><div id="skill-vision-provider-menu" class="skill-option-menu"></div></div>
+                  </div>
+                  <label><span class="skill-field-label" data-i18n="本次提炼指令">本次提炼指令</span><textarea id="skill-text-instruction" rows="5"></textarea></label>
+                  <label><span class="skill-field-label" data-i18n="本次视觉分析指令">本次视觉分析指令</span><textarea id="skill-vision-instruction" rows="4"></textarea></label>
+                  <div class="skill-advanced-actions"><button id="skill-restore-instructions" class="button-secondary" type="button" data-i18n="恢复默认指令">恢复默认指令</button></div>
+                  <div id="skill-request-preview" class="skill-request-preview"></div>
+                </div>
+              </details>
+              <div class="skill-step-actions"><button data-i18n="查看草稿" id="skill-show-draft" class="button-secondary" type="button" hidden>查看草稿</button><button id="skill-generate" type="button" data-i18n="生成可编辑草稿">生成可编辑草稿</button><button id="skill-retry-vision" class="button-secondary" type="button" hidden data-i18n="重试失败批次">重试失败批次</button></div>
+              <section id="skill-run-panel" class="skill-run-panel" hidden aria-live="polite">
+                <div class="skill-run-heading"><div><strong id="skill-generation-status" class="ui-task-feedback" role="status"></strong><span id="skill-run-elapsed"></span></div><button id="skill-stop-run" class="button-secondary" type="button" data-i18n="停止">停止</button></div>
+                <progress id="skill-run-progress" class="ui-task-progress" aria-label="Skill 提炼进度" data-i18n-aria-label="Skill 提炼进度"></progress>
+                <ol id="skill-run-stages" class="skill-run-stages"></ol>
+                <details class="skill-run-log"><summary data-i18n="运行记录">运行记录</summary><div id="skill-run-log"></div></details>
+              </section>
+              <p id="skill-generation-feedback" class="skill-feedback ui-task-feedback" role="status"></p>
+            </section>
+
+            <section id="skill-draft-step" class="skill-step skill-draft-step" tabindex="-1" hidden>
+              <div class="skill-section-heading"><div><small>03</small><strong data-i18n="编辑并保存">编辑并保存</strong></div><span id="skill-version-label"></span></div>
+              <div class="skill-result-actions"><button data-i18n="返回选材" id="skill-back-sources" class="button-secondary" type="button">返回选材</button><button id="skill-add-files" class="button-secondary" type="button" data-i18n="添加文件">添加文件</button><button id="skill-add-folder" class="button-secondary" type="button" data-i18n="添加文件夹">添加文件夹</button><button id="skill-save" type="button" data-i18n="保存 Skill">保存 Skill</button></div>
+              <div class="skill-name-grid">
+                <label><span data-i18n="调用名">调用名</span><div class="skill-call-name"><b>/</b><input id="skill-call-name" maxlength="80" placeholder="你的 Skill 名称" data-i18n-placeholder="你的 Skill 名称" /></div></label>
+                <label><span data-i18n="说明">说明</span><input id="skill-description" maxlength="240" placeholder="它在什么创作任务中发挥作用" data-i18n-placeholder="它在什么创作任务中发挥作用" /></label>
+              </div>
+              <div id="skill-cover-editor"></div>
+              <div id="skill-draft-preview"></div>
+              <textarea id="skill-markdown" class="skill-markdown-editor" rows="22" aria-label="SKILL.md 正文" data-i18n-aria-label="SKILL.md 正文" hidden></textarea>
+              <input id="skill-add-files-input" type="file" multiple hidden />
+              <input id="skill-add-folder-input" type="file" webkitdirectory multiple hidden />
+
+              <p id="skill-save-status" class="skill-feedback ui-task-feedback" role="status"></p>
+            </section>
+
+            <section id="skill-versions-step" class="skill-step" hidden>
+              <div class="skill-section-heading"><div><small data-i18n="版本">版本</small><strong data-i18n="已保存版本">已保存版本</strong></div><span data-i18n="最多保留 10 个">最多保留 10 个</span></div>
+              <div id="skill-version-list" class="skill-version-list"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="skill-source-inspector-backdrop" class="skill-source-inspector-backdrop" hidden></div>
+    <aside id="skill-source-inspector" class="skill-source-inspector" hidden role="dialog" aria-modal="true" aria-labelledby="skill-source-inspector-title">
+      <header><div><small data-i18n="精确选择">精确选择</small><h2 id="skill-source-inspector-title"></h2></div><button id="skill-source-inspector-close" class="icon-button" type="button" aria-label="关闭" title="关闭" data-i18n-aria-label="关闭" data-i18n-title="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="assets/ui-icons.svg#icon-x"></use></svg></button></header>
+      <div class="skill-source-inspector-actions"><button id="skill-source-select-all" class="button-secondary" type="button" data-i18n="全选可用内容">全选可用内容</button><button id="skill-source-clear" class="button-secondary" type="button" data-i18n="清空本案例">清空本案例</button></div>
+      <label id="skill-source-text-option" class="skill-source-text-option"><input id="skill-source-include-text" type="checkbox" /><span data-i18n="包含案例文字">包含案例文字</span></label>
+      <div id="skill-source-asset-list" class="skill-source-asset-list"></div>
+      <footer class="skill-source-inspector-footer"><button id="skill-source-cancel" class="button-secondary" type="button" data-i18n="取消">取消</button><button id="skill-source-apply" type="button" data-i18n="应用选择">应用选择</button></footer>
+    </aside>
+
+    <dialog id="skill-import-dialog" class="skill-import-dialog ui-dialog">
+      <header class="ui-dialog-header"><div class="ui-dialog-heading"><h2 data-i18n="导入外部 Skill">导入外部 Skill</h2></div><button id="skill-import-close" class="icon-button" type="button" aria-label="关闭" data-i18n-aria-label="关闭" title="关闭" data-i18n-title="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="assets/ui-icons.svg#icon-x"></use></svg></button></header>
+      <div class="ui-dialog-body"><p data-i18n="完整包会随私人备份保留；PromptDirector 可展示成果封面并读取方法文档，不执行包内程序。">完整包会随私人备份保留；PromptDirector 可展示成果封面并读取方法文档，不执行包内程序。</p></div>
+      <footer class="ui-dialog-footer"><button id="skill-import-zip" type="button" data-i18n="选择 .zip / .skill / .md">选择 .zip / .skill / .md</button><button id="skill-import-folder" class="button-secondary" type="button" data-i18n="选择目录">选择目录</button></footer>
+    </dialog>
+    <dialog id="skill-submission-dialog" class="skill-submission-dialog ui-dialog">
+      <header class="ui-dialog-header"><div class="ui-dialog-heading"><h2 data-i18n="投稿到精选 Skill">投稿到精选 Skill</h2></div><button id="skill-submission-close" class="icon-button" type="button" aria-label="关闭" title="关闭" data-i18n-aria-label="关闭" data-i18n-title="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="assets/ui-icons.svg#icon-x"></use></svg></button></header>
+      <div class="ui-dialog-body"><p data-i18n="投稿包含公开方法和一张成果封面，请确认这些内容可以公开分享。">投稿包含公开方法和一张成果封面，请确认这些内容可以公开分享。</p>
+      <div class="skill-submission-fields">
+        <label><span data-i18n="公开署名">公开署名</span><input id="skill-submission-author" autocomplete="name" aria-describedby="skill-submission-author-error" /><small id="skill-submission-author-error" class="skill-submission-field-error" hidden></small></label>
+        <label class="skill-submission-summary"><span data-i18n="公开摘要">公开摘要</span><textarea id="skill-submission-summary" rows="3" aria-describedby="skill-submission-summary-error"></textarea><small id="skill-submission-summary-error" class="skill-submission-field-error" hidden></small></label>
+        <label class="skill-submission-rights"><input id="skill-submission-rights" type="checkbox" aria-describedby="skill-submission-rights-error" /><span data-i18n="允许其他用户在保留署名的前提下保存、使用和修改。">允许其他用户在保留署名的前提下保存、使用和修改。</span></label>
+        <small id="skill-submission-rights-error" class="skill-submission-field-error skill-submission-rights-error" hidden></small>
+        <details class="skill-submission-license-details"><summary data-i18n="了解公开使用规则">了解公开使用规则</summary><p data-i18n="投稿采用 CC BY 4.0：其他用户必须保留你的公开署名，并可保存、使用和修改这份 Skill。">投稿采用 CC BY 4.0：其他用户必须保留你的公开署名，并可保存、使用和修改这份 Skill。</p></details>
+      </div>
+      <div class="skill-submission-actions"><button id="skill-submission-refresh" class="button-secondary" type="button" data-i18n="生成并检查公开快照">生成并检查公开快照</button><button id="skill-submission-open" type="button" disabled data-i18n="下载投稿包并打开 GitHub">下载投稿包并打开 GitHub</button></div>
+      <p id="skill-submission-feedback" class="skill-feedback ui-task-feedback" role="status"></p>
+      <section id="skill-submission-findings" class="skill-submission-findings" hidden><h3 data-i18n="需要先处理的隐私风险">需要先处理的隐私风险</h3><ul></ul></section>
+      <section class="skill-submission-preview-shell"><h3 data-i18n="最终投稿文件与全文">最终投稿文件与全文</h3><div id="skill-submission-preview" class="skill-submission-preview"></div></section></div>
+    </dialog>
+    <script type="module" src="skills-page.js"></script>
+  </body>
+</html>

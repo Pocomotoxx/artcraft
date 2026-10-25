@@ -1,0 +1,75 @@
+import { isMain } from "./is-main.mjs";
+import { mkdir, writeFile, readdir, cp, rename } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { connectorRoot, ensurePrivateRoot, instancePaths, readJson } from './paths.mjs';
+import { windowsLauncher, registerWindowsHost, nativeRegistryKey } from './windows.mjs';
+import { nodeCommand } from './node-command.mjs';
+const source = dirname(fileURLToPath(import.meta.url));
+const shellQuote = value => `'${value.replaceAll("'", "'\\''")}'`;
+export async function installationPlan({ root = connectorRoot(), nativeDirectory, extensionId } = {}) {
+  if (process.platform === 'linux' && process.env.WSL_INTEROP && !nativeDirectory) {
+    throw new Error('WSL detected; to connect Windows Chrome, run the installer with native Windows Node.js.');
+  }
+  if (!nativeDirectory) {
+    if (process.platform === 'darwin') nativeDirectory = join(homedir(), 'Library/Application Support/Google/Chrome/NativeMessagingHosts');
+    else if (process.platform === 'linux') nativeDirectory = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'google-chrome/NativeMessagingHosts');
+    else if (process.platform === 'win32') nativeDirectory = join(root, 'NativeMessagingHosts');
+    else throw new Error('The current local bridge does not support this operating system yet; no Chrome or Agent configuration was written.');
+  }
+  if (!extensionId) {
+    const manifest = await readJson(resolve(source, '../extension/manifest.json'));
+    extensionId = [...createHash('sha256').update(Buffer.from(manifest.key, 'base64')).digest().subarray(0, 16)]
+      .map(byte => String.fromCharCode(97 + (byte >> 4), 97 + (byte & 15))).join('');
+  }
+  if (!/^[a-p]{32}$/.test(extensionId)) throw new Error('Invalid Chrome extension ID.');
+  return { root: resolve(root), nativeDirectory: resolve(nativeDirectory), extensionId,
+    runtime: join(resolve(root), 'runtime'), launcher: join(resolve(root), process.platform === 'win32' ? 'native-host.cmd' : 'native-host'),
+    ...(process.platform === 'win32' ? { registryKey: nativeRegistryKey } : {}),
+    registration: join(resolve(nativeDirectory), 'com.promptdirector.connector.json'), node: nodeCommand() };
+}
+async function atomicWrite(path, text, mode = 0o600) {
+  const temp = `${path}.${randomUUID()}.tmp`;
+  await writeFile(temp, text, { mode, flag: 'wx' }); await rename(temp, path);
+}
+export async function install(plan, { register = registerWindowsHost } = {}) {
+  await ensurePrivateRoot(plan.root);
+  // A stable private runtime survives moving the development checkout. Copy
+  // dependencies without install scripts; the lockfile identifies their source.
+  await mkdir(plan.runtime, { recursive: true, mode: 0o700 });
+  const sharedDirectory = join(plan.root, 'extension');
+  await mkdir(sharedDirectory, { recursive: true, mode: 0o700 });
+  await atomicWrite(join(sharedDirectory, 'package.json'), JSON.stringify({ type: 'module' }));
+  for (const name of ['resource-policy.js', 'agent-protocol.js', 'capture-operation-specs.js', 'workspace-screenshot-specs.js', 'agent-case-action-specs.js', 'workspace-operation-specs.js', 'case-query-specs.js', 'case-operation-specs.js', 'project-operation-specs.js', 'skill-operation-specs.js', 'analysis-batch-specs.js', 'visual-result-schema.js']) {
+    await cp(resolve(source, '../extension', name), join(sharedDirectory, name));
+  }
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    if (entry.name.endsWith('.mjs') || ['node_modules', 'package.json', 'package-lock.json', 'SKILL.md', 'README.md', 'INSTALL.md'].includes(entry.name)) {
+      await cp(join(source, entry.name), join(plan.runtime, entry.name), { recursive: true, dereference: true });
+    }
+  }
+  await atomicWrite(join(plan.root, 'config.json'), JSON.stringify({ extensionId: plan.extensionId }));
+  await atomicWrite(plan.launcher, process.platform === 'win32' ? windowsLauncher(plan) : `#!/bin/sh\nexport PROMPTDIRECTOR_CONNECTOR_HOME=${shellQuote(plan.root)}\nexec ${shellQuote(plan.node)} ${shellQuote(join(plan.runtime, 'native-host.mjs'))} "$@"\n`, 0o700);
+  await mkdir(plan.nativeDirectory, { recursive: true });
+  await atomicWrite(plan.registration, JSON.stringify({ name: 'com.promptdirector.connector', description: 'PromptDirector local Agent connector',
+    path: plan.launcher, type: 'stdio', allowed_origins: [`chrome-extension://${plan.extensionId}/`] }, null, 2));
+  if (process.platform === 'win32') await register(plan.registration);
+  return { ...plan, next: 'Enable the Agent connection in the plugin settings, then run pair with the pairing number.' };
+}
+export async function pair(instanceId, root = connectorRoot()) {
+  await ensurePrivateRoot(root);
+  const { record } = instancePaths(root, instanceId);
+  const value = await readJson(record);
+  if (value.instanceId !== instanceId || !/^[a-f0-9]{64}$/.test(value.secret)) throw new Error('No valid library pairing record was found.');
+  await atomicWrite(join(root, 'selected.json'), JSON.stringify({ instanceId }));
+  return { instanceId, mcp: { command: nodeCommand(), args: [join(root, 'runtime/mcp.mjs')], env: { PROMPTDIRECTOR_CONNECTOR_HOME: root } } };
+}
+if (isMain(import.meta.url)) {
+  const [command = 'plan', instanceId] = process.argv.slice(2);
+  if (command === 'plan') console.log(JSON.stringify(await installationPlan(), null, 2));
+  else if (command === 'install') console.log(JSON.stringify(await install(await installationPlan()), null, 2));
+  else if (command === 'pair') console.log(JSON.stringify(await pair(instanceId), null, 2));
+  else throw new Error('Usage: node connector/install.mjs plan | install | pair <pairing-number>');
+}

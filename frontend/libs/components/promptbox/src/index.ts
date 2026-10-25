@@ -11,6 +11,7 @@ export * from "./lib/useAutoGrowEditorHeight";
 export * from "./lib/PromptFullscreenModal";
 export * from "./lib/PromptFullscreenButton";
 export * from "./lib/PromptClearAllButton";
+export * from "./lib/PromptDirectorButton";
 export * from "./lib/promptStore";
 export * from "./lib/MentionTextarea";
 export * from "./lib/MentionChipMenu";

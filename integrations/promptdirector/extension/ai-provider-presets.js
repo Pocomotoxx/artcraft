@@ -1,0 +1,128 @@
+const TEXT_CAPABILITIES = Object.freeze(["textTags", "skillExtraction", "creativePlanning"]);
+
+function preset(value) {
+  return Object.freeze({
+    ...value,
+    discovery: Object.freeze({ ...value.discovery }),
+    capabilities: Object.freeze([...value.capabilities]),
+    catalogRequiredTasks: Object.freeze([...(value.catalogRequiredTasks ?? [])]),
+    ...(value.mediaInput ? { mediaInput: Object.freeze({ ...value.mediaInput }) } : {})
+  });
+}
+
+export const AI_PROVIDER_PRESETS = Object.freeze([
+  preset({
+    id: "deepseek",
+    label: "DeepSeek",
+    category: "official",
+    endpoint: "https://api.deepseek.com/chat/completions",
+    protocol: "chat_completions",
+    discovery: { adapter: "identity" },
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis"],
+    structuredOutput: "json_object"
+  }),
+  preset({
+    id: "zhipu",
+    label: "智谱 GLM",
+    category: "official",
+    endpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    protocol: "chat_completions",
+    discovery: { adapter: "identity" },
+    catalogCompleteness: "partial",
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis", "videoAnalysis"],
+    structuredOutput: "prompt_only",
+    mediaInput: {
+      imageBase64: "raw",
+      localVideo: "unsupported",
+      preferPublicVideoUrl: true,
+      publicVideoUrl: "direct"
+    }
+  }),
+  preset({
+    id: "openai",
+    label: "OpenAI",
+    category: "official",
+    endpoint: "https://api.openai.com/v1/responses",
+    protocol: "responses",
+    discovery: { adapter: "identity" },
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis", "imageGeneration", "videoGeneration"]
+  }),
+  preset({
+    id: "gemini",
+    label: "Google Gemini",
+    category: "official",
+    endpoint: "https://generativelanguage.googleapis.com",
+    protocol: "gemini",
+    discovery: { adapter: "gemini" },
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis", "videoAnalysis", "imageGeneration", "videoGeneration"],
+    catalogRequiredTasks: ["imageGeneration"]
+  }),
+  preset({
+    id: "xai",
+    label: "xAI",
+    category: "official",
+    endpoint: "https://api.x.ai/v1",
+    protocol: "xai",
+    discovery: { adapter: "xai" },
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis", "imageGeneration", "videoGeneration"]
+  }),
+  preset({
+    id: "kimi",
+    label: "Kimi",
+    category: "official",
+    endpoint: "https://api.moonshot.cn/v1/chat/completions",
+    protocol: "chat_completions",
+    discovery: { adapter: "kimi" },
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis", "videoAnalysis"]
+  }),
+  preset({
+    id: "minimax",
+    label: "MiniMax",
+    category: "official",
+    endpoint: "https://api.minimaxi.com/v1",
+    protocol: "minimax_videos",
+    discovery: { adapter: "configured_video" },
+    capabilities: ["videoGeneration"]
+  }),
+  preset({
+    id: "volcengine",
+    label: "火山引擎",
+    category: "official",
+    endpoint: "https://ark.cn-beijing.volces.com/api/v3",
+    protocol: "ark_videos",
+    discovery: { adapter: "configured_video" },
+    capabilities: ["videoGeneration"]
+  }),
+  preset({
+    id: "openrouter",
+    label: "OpenRouter",
+    category: "aggregator",
+    endpoint: "https://openrouter.ai/api/v1",
+    protocol: "openrouter",
+    discovery: { adapter: "openrouter" },
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis", "videoAnalysis", "imageGeneration", "videoGeneration"]
+  }),
+  preset({
+    id: "custom-text",
+    label: "自定义兼容服务（对话与识别）",
+    category: "custom",
+    endpoint: "",
+    protocol: "chat_completions",
+    discovery: { adapter: "identity" },
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis", "videoAnalysis"]
+  }),
+  preset({
+    id: "custom-media",
+    label: "自定义图片生成服务",
+    category: "custom",
+    endpoint: "",
+    protocol: "chat_completions",
+    discovery: { adapter: "identity" },
+    capabilities: [...TEXT_CAPABILITIES, "imageAnalysis", "imageGeneration"]
+  })
+]);
+
+export function getAiProviderPreset(idValue) {
+  const id = String(idValue ?? "").trim();
+  return AI_PROVIDER_PRESETS.find((item) => item.id === id) ?? null;
+}

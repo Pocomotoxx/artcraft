@@ -59,6 +59,7 @@ import {
 } from "./PromptFullscreenModal";
 import { PromptFullscreenButton } from "./PromptFullscreenButton";
 import { PromptClearAllButton } from "./PromptClearAllButton";
+import { PromptDirectorButton } from "./PromptDirectorButton";
 
 declare global {
   interface Window {
@@ -1557,6 +1558,7 @@ export const PromptBoxVideo = ({
                   handleCountChange={setGenerationCount}
                 />
               )}
+              <PromptDirectorButton onPick={setPrompt} />
               <PromptClearAllButton
                 onClick={handleClearAll}
                 disabled={!hasClearableContent}

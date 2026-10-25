@@ -56,6 +56,7 @@ use crate::services::midjourney::commands::midjourney_clear_credentials_command:
 use crate::services::midjourney::commands::midjourney_get_credential_info_command::midjourney_get_credential_info_command;
 use crate::services::midjourney::commands::midjourney_open_login_command::midjourney_open_login_command;
 use crate::services::midjourney::state::midjourney_credential_manager::MidjourneyCredentialManager;
+use crate::services::promptdirector::commands::promptdirector_call_tool_command::promptdirector_call_tool_command;
 use crate::services::sora::commands::check_sora_session_command::check_sora_session_command;
 use crate::services::sora::commands::open_sora_login_command::open_sora_login_command;
 use crate::services::sora::commands::sora_get_credential_info_command::sora_get_credential_info_command;
@@ -250,6 +251,7 @@ pub fn run() {
     get_app_preferences_command,
     get_provider_order_command,
     get_task_queue_command,
+    promptdirector_call_tool_command,
     provider_clear_command,
     provider_list_command,
     provider_set_api_key_command,

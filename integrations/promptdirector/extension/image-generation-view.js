@@ -1,0 +1,38 @@
+import { normalizeGenerationInfo, readImageGenerationInfo } from './image-generation-info.js';
+
+// A view projection, never a migration or a prompt writer. Keep only the open
+// case cached so reading old originals does not become a library-wide scan.
+export function createGenerationInfoViewReader(readBlob) {
+  let caseId;
+  let cache = new Map();
+  return async function read(entry, { assetIds } = {}) {
+    if (caseId !== entry.id) { caseId = entry.id; cache = new Map(); }
+    const currentCache = cache;
+    const mediaAssets = [];
+    for (const asset of entry.mediaAssets ?? []) {
+      if (asset.kind !== 'image' || asset.usage === 'poster' || normalizeGenerationInfo(asset.generationInfo)
+          || (assetIds && !assetIds.includes(asset.id))) {
+        mediaAssets.push(asset);
+        continue;
+      }
+      const key = JSON.stringify([asset.id, asset.contentHash, asset.byteSize, asset.capturedAt]);
+      if (!currentCache.has(key)) currentCache.set(key, (async () => {
+        const blob = await readBlob(asset.id);
+        return blob ? readImageGenerationInfo(blob) : null;
+      })());
+      try {
+        const generationInfo = await currentCache.get(key);
+        mediaAssets.push(generationInfo ? { ...asset, generationInfo } : asset);
+      } catch (error) {
+        currentCache.delete(key);
+        console.warn('[generation-info] Original metadata read failed', error?.name || 'Error');
+        mediaAssets.push(asset);
+      }
+    }
+    const byId = new Map(mediaAssets.map(asset => [asset.id, asset]));
+    return { ...entry, mediaAssets,
+      ...(Array.isArray(entry.memberEntries) ? { memberEntries: entry.memberEntries.map(member => ({
+        ...member, mediaAssets: (member.mediaAssets ?? []).map(asset => byId.get(asset.id) ?? asset)
+      })) } : {}) };
+  };
+}

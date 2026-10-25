@@ -1,0 +1,3380 @@
+import { PAGE_CAPTURE_ADAPTERS, resolvePageCaptureAdapter } from "./page-capture-adapter-registry.js";
+import { PAGE_CAPTURE_QUALITY_LIMITS, LIBRARY_TRANSFER_LIMITS } from "./resource-limits.js";
+import { normalizeArticleDocument, remapArticleDocumentAssets } from "./article-document.js";
+import { isSupportedDocumentMimeType } from "./bounded-media.js";
+
+export { PAGE_CAPTURE_ADAPTERS, PAGE_CAPTURE_PLATFORM_ADAPTERS } from "./page-capture-adapter-registry.js";
+
+const PAGE_TYPES = new Set(["article", "artwork", "post", "gallery", "feed", "video", "generic"]);
+const COMPLETENESS = new Set(["complete", "partial"]);
+
+export function detectPageCaptureAdapter(value, adapters = PAGE_CAPTURE_ADAPTERS) {
+  return resolvePageCaptureAdapter(value, {}, adapters);
+}
+
+export function pageCaptureDefaultMediaIds(candidateValue = {}) {
+  return (normalizePageCaptureCandidate(candidateValue)?.media || [])
+    .filter((item) => !item.isQuoted && !item.quotedPostUrl && (item.placement === "inline" || item.isCover))
+    .map((item) => item.id);
+}
+
+export function resolvePageCapturePageType({
+  adapterPageType = "generic",
+  structuredTypes = [],
+  articleTextLength = 0,
+  cardCount = 0,
+  metadataType = ""
+} = {}) {
+  if (adapterPageType === "post") return "post";
+  if (structuredTypes.some((type) => ["Article", "NewsArticle", "BlogPosting"].includes(type))) return "article";
+  if (structuredTypes.includes("VideoObject") || ["youtube", "bilibili"].includes(adapterPageType)) return "video";
+  if (structuredTypes.some((type) => ["Article", "NewsArticle", "BlogPosting"].includes(type)) || articleTextLength > 500) return "article";
+  if (cardCount > 1) return metadataType === "website" ? "gallery" : "feed";
+  return PAGE_TYPES.has(adapterPageType) ? adapterPageType : "generic";
+}
+
+export function reconcilePageCaptureArticlePlacement({ articleDocument, media: mediaValue, contentTargets } = {}) {
+  const documentValue = normalizeArticleDocument(articleDocument) || { version: 1, blocks: [] };
+  const media = uniqueMedia(mediaValue);
+  const mediaById = new Map(media.map((item) => [item.id, item]));
+  const blocksById = new Map(documentValue.blocks.map((block) => [block.id, block]));
+  const blocksByAssetId = new Map(documentValue.blocks.flatMap((block) => block.assetId ? [[block.assetId, block]] : []));
+  const inlineIds = new Set(documentValue.blocks.flatMap((block) => block.assetId && mediaById.has(block.assetId) ? [block.assetId] : []));
+  const tableCellIds = new Set(documentValue.blocks.flatMap(block => (block.rows || []).flatMap(row => row.flatMap(cell => cell.blockIds))));
+  const emittedBlockIds = new Set();
+  const emittedAssetIds = new Set();
+  const orderedBlocks = [];
+  const emit = (block) => {
+    if (!block || emittedBlockIds.has(block.id) || block.assetId && emittedAssetIds.has(block.assetId) && !tableCellIds.has(block.id)) return;
+    emittedBlockIds.add(block.id);
+    if (block.assetId) emittedAssetIds.add(block.assetId);
+    orderedBlocks.push(block);
+  };
+  const mediaBlock = (item) => ({
+    id: `article:${item.kind}:${item.id}`,
+    kind: item.kind,
+    assetId: item.id,
+    sourceUrl: item.url,
+    ...(item.posterUrl ? { posterUrl: item.posterUrl } : {}),
+    label: item.alt || item.filename || ""
+  });
+
+  for (const target of (Array.isArray(contentTargets) ? contentTargets : [])
+    .filter((item) => item?.kind !== "group")
+    .sort((left, right) => Number(left.sourceOrder || 0) - Number(right.sourceOrder || 0))) {
+    for (const blockId of target.articleBlockIds || []) emit(blocksById.get(blockId));
+    for (const mediaId of target.mediaIds || []) {
+      const item = mediaById.get(mediaId);
+      if (!item) continue;
+      inlineIds.add(mediaId);
+      emit(blocksByAssetId.get(mediaId) || mediaBlock(item));
+    }
+  }
+  for (const block of documentValue.blocks) {
+    if (block.assetId && !inlineIds.has(block.assetId)) continue;
+    emit(block);
+  }
+
+  return {
+    articleDocument: normalizeArticleDocument({
+      version: documentValue.version || 1,
+      blocks: orderedBlocks.map((block, sourceOrder) => ({ ...block, sourceOrder }))
+    }),
+    media: media.map((item) => ({ ...item, placement: inlineIds.has(item.id) ? "inline" : "unplaced" }))
+  };
+}
+
+export function normalizePageCaptureBatch(value = {}) {
+  const candidates = uniqueCandidates(value.candidates);
+  const legacySelections = Array.isArray(value.selectedIds)
+    ? value.selectedIds.map((candidateId) => {
+      const candidate = candidates.find((item) => item.id === clean(candidateId));
+      return candidate ? {
+        candidateId: candidate.id,
+        includeText: Boolean(candidate.contentText || candidate.excerpt),
+        selectedMediaIds: candidate.media.map((item) => item.id)
+      } : null;
+    }).filter(Boolean)
+    : [];
+  const selections = (Array.isArray(value.selections) ? value.selections : legacySelections)
+    .map((selection) => normalizePageCaptureSelection(selection, candidates))
+    .filter(Boolean);
+  return {
+    id: clean(value.id) || globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+    tabId: Number.isInteger(Number(value.tabId)) ? Number(value.tabId) : null,
+    sourceUrl: safeUrl(value.sourceUrl),
+    adapter: clean(value.adapter) || "generic",
+    selectionTemplate: (!value.adapter || value.adapter === "generic") && safeUrl(value.selectionTemplate?.sourceUrl) && clean(value.selectionTemplate?.marker)
+      ? { sourceUrl: safeUrl(value.selectionTemplate.sourceUrl), marker: clean(value.selectionTemplate.marker),
+        ...(Array.isArray(value.selectionTemplate.mediaSources) && value.selectionTemplate.mediaSources.length
+          ? { mediaSources: [...new Set(value.selectionTemplate.mediaSources.map(safeUrl).filter(Boolean))] } : {}) } : null,
+    captureMode: value.captureMode === "list" ? "list" : "single",
+    articleSplit: value.articleSplit === true,
+    detailsRead: value.detailsRead === true,
+    genericGrouping: value.adapter === "generic" && ["whole", "sections", "media", "manual"].includes(value.genericGrouping) ? value.genericGrouping : "",
+    saveMode: value.saveMode === "combined" ? "combined" : value.saveMode === "multiple" ? "multiple" : value.captureMode === "list" ? "" : "single",
+    combinedTitle: clean(value.combinedTitle),
+    targetCount: positiveInteger(value.targetCount, 0),
+    stopReason: ["target-reached", "no-new-items", "no-next-page", "manual-template-page", "layout-changed", "pagination-failed", "cancelled"].includes(value.stopReason) ? value.stopReason : "",
+    status: ["preview", "scanning", "saving", "completed", "cancelled", "failed"].includes(value.status) ? value.status : "preview",
+    sessionMediaAllowed: value.sessionMediaAllowed !== false,
+    candidates,
+    selections,
+    discoveredCount: candidates.length,
+    createdAt: validIso(value.createdAt) || new Date().toISOString(),
+    error: clean(value.error)
+  };
+}
+
+export function combinePageCaptureCandidates(values = [], options = {}) {
+  const candidates = (Array.isArray(values) ? values : []).map(normalizePageCaptureCandidate).filter(Boolean);
+  if (!candidates.length) return null;
+  const canonicalUrl = safeUrl(options.canonicalUrl) || candidates[0].canonicalUrl;
+  const title = clean(options.title) || candidates[0].title;
+  if (candidates.length === 1) return normalizePageCaptureCandidate({ ...candidates[0], canonicalUrl, title });
+  const ordered = candidates.map((candidate, index) => ({ candidate, index }));
+  const textBlocks = ordered.flatMap(({ candidate, index }) => {
+    const text = [candidate.title, candidate.contentText].filter(Boolean).join("\n");
+    return text ? [{
+      id: stableCandidateId(canonicalUrl, `combined\n${index}\n${text}`),
+      text,
+      html: "",
+      kind: "section",
+      sourceOrder: index
+    }] : [];
+  });
+  const articleBlocks = ordered.flatMap(({ candidate, index }) => {
+    const documentValue = normalizeArticleDocument(candidate.articleDocument);
+    const blocks = documentValue?.blocks || (candidate.contentText
+      ? [{ id: 'body', kind: 'paragraph', mimeType: 'text/markdown', text: candidate.contentText }] : []);
+    return [
+      { id: `combined:${index}:title`, kind: "heading", level: 2, text: candidate.title, sourceOrder: 0 },
+      ...blocks.map((block) => ({ ...block, id: `combined:${index}:${block.id}`,
+        ...(block.rows ? { rows: block.rows.map(row => row.map(cell => ({ ...cell, blockIds: cell.blockIds.map(id => `combined:${index}:${id}`) }))) } : {}) }))
+    ];
+  }).map((block, sourceOrder) => ({ ...block, sourceOrder }));
+  return normalizePageCaptureCandidate({
+    id: stableCandidateId(canonicalUrl, `combined\n${candidates.map((item) => item.id).join("\n")}`),
+    title,
+    canonicalUrl,
+    pageType: "gallery",
+    contentText: textBlocks.map((item) => item.text).join("\n\n"),
+    textBlocks,
+    articleDocument: { version: 1, blocks: articleBlocks },
+    // Block IDs are renamed per source; detail links follow them, and each
+    // medium keeps provenance it already carries (e.g. read detail pages).
+    media: candidates.flatMap((candidate, index) => candidate.media.map((media) => ({
+      ...media,
+      ...(media.detailBlockIds ? { detailBlockIds: media.detailBlockIds.map(id => `combined:${index}:${id}`) } : {}),
+      sourceTitle: media.sourceTitle || candidate.title,
+      sourceAuthor: media.sourceAuthor || candidate.sourceFacts.author,
+      originalWorkUrl: media.originalWorkUrl || candidate.canonicalUrl
+    }))),
+    sourceFacts: {
+      provider: hostname(canonicalUrl),
+      pageType: "gallery",
+      captureScope: "document",
+      extractionMethod: "page",
+      status: "complete"
+    },
+    completeness: "complete",
+    extraction: { scope: "document", method: "page" },
+    adapter: "generic"
+  });
+}
+
+export function normalizePageCaptureSelection(value = {}, candidatesValue = []) {
+  const candidates = Array.isArray(candidatesValue) ? candidatesValue : [];
+  const candidateId = clean(value.candidateId);
+  const candidate = candidates.find((item) => item.id === candidateId);
+  if (!candidate) return null;
+  const mediaIds = new Set(candidate.media.map((item) => item.id));
+  const selectedMediaIds = [...new Set((Array.isArray(value.selectedMediaIds) ? value.selectedMediaIds : [])
+    .map(clean).filter((id) => mediaIds.has(id)))];
+  const mediaDecision = value.mediaDecision === "confirmed"
+    ? "confirmed"
+    : value.mediaDecision === "none" ? "none" : "pending";
+  const hasTextBlockSelection = Array.isArray(value.selectedTextBlockIds);
+  const textBlockIds = new Set(candidate.textBlocks.map((item) => item.id));
+  const selectedTextBlockIds = [...new Set((hasTextBlockSelection ? value.selectedTextBlockIds : [])
+    .map(clean).filter((id) => textBlockIds.has(id)))];
+  const includeText = hasTextBlockSelection
+    ? selectedTextBlockIds.length > 0
+    : value.includeText === true && Boolean(candidate.contentText || candidate.excerpt);
+  if (!includeText && !selectedMediaIds.length) return null;
+  return {
+    candidateId,
+    includeText,
+    ...(hasTextBlockSelection ? { selectedTextBlockIds } : {}),
+    selectedMediaIds: mediaDecision === "none" ? [] : selectedMediaIds,
+    mediaDecision
+  };
+}
+
+export function mergePageCaptureRegionEdit(originalValue, revisedValue) {
+  const original = normalizePageCaptureCandidate(originalValue);
+  const revised = normalizePageCaptureCandidate(revisedValue);
+  if (!original || !revised) return original || revised;
+  const revisedToOriginalIds = new Map();
+  const media = revised.media.map((item) => {
+    const originalItem = original.media.find((candidate) => mediaValuesOverlap(candidate, item));
+    if (!originalItem) return item;
+    revisedToOriginalIds.set(item.id, originalItem.id);
+    return {
+      ...item,
+      ...originalItem,
+      id: originalItem.id,
+      variants: [...(originalItem.variants || []), ...(item.variants || [])]
+    };
+  });
+  return normalizePageCaptureCandidate({
+    ...revised,
+    id: original.id,
+    title: original.title,
+    canonicalUrl: original.canonicalUrl,
+    pageType: original.pageType,
+    sourceFacts: original.sourceFacts,
+    adapter: original.adapter,
+    region: revised.region
+      ? {
+          ...original.region,
+          contentTargets: (revised.region.contentTargets?.length ? revised.region.contentTargets : original.region?.contentTargets || [])
+            .map((target) => ({
+              ...target,
+              mediaIds: (target.mediaIds || []).map((id) => revisedToOriginalIds.get(id) || id)
+            })),
+          edits: revised.region.edits || []
+        }
+      : original.region,
+    media,
+    articleDocument: remapArticleDocumentAssets(revised.articleDocument, revisedToOriginalIds)
+  });
+}
+
+function mediaValuesOverlap(left, right) {
+  if (left?.kind && right?.kind && left.kind !== right.kind) return false;
+  const identity = (value) => pageCaptureMediaIdentity(value) || value;
+  const leftUrls = new Set([left.url, ...(left.variants || []).map((item) => item.url)].filter(Boolean).map(identity));
+  return [right.url, ...(right.variants || []).map((item) => item.url)]
+    .filter(Boolean)
+    .map(identity)
+    .some((url) => leftUrls.has(url));
+}
+
+export function applyPageCaptureSelections(batchValue = {}) {
+  const batch = normalizePageCaptureBatch(batchValue);
+  return batch.selections.flatMap((selection) => {
+    const candidate = batch.candidates.find((item) => item.id === selection.candidateId);
+    if (!candidate) return [];
+    const selectedMediaIds = new Set(selection.mediaDecision === "confirmed" ? selection.selectedMediaIds : []);
+    const hasTextBlockSelection = Array.isArray(selection.selectedTextBlockIds);
+    const selectedTextBlockIds = new Set(selection.selectedTextBlockIds || []);
+    const selectedTextBlocks = (hasTextBlockSelection
+      ? candidate.textBlocks.filter((item) => selectedTextBlockIds.has(item.id))
+      : candidate.textBlocks)
+      .sort((left, right) => (left.sourceOrder ?? 0) - (right.sourceOrder ?? 0));
+    const selectedAllText = !hasTextBlockSelection || selectedTextBlocks.length === candidate.textBlocks.length;
+    const selectedText = selection.includeText
+      ? selectedTextBlocks.map((item) => item.text).join("\n\n")
+      : "";
+    const selectedHtml = selection.includeText && selectedTextBlocks.every((item) => item.html)
+      ? selectedTextBlocks.map((item) => item.html).join("")
+      : "";
+    const articleDocument = filterCandidateArticleDocument(candidate.articleDocument, {
+      includeText: selection.includeText,
+      selectedAllText,
+      selectedTextBlockIds,
+      selectedMediaIds
+    });
+    const sourceFacts = { ...candidate.sourceFacts };
+    if (!selection.includeText) sourceFacts.originalPromptAvailable = false;
+    else if (!selectedAllText && sourceFacts.originalPromptAvailable === true) {
+      const knownPrompts = candidate.media.map(item => item.originalPrompt).filter(Boolean);
+      if (knownPrompts.length) sourceFacts.originalPromptAvailable = knownPrompts.some(prompt => selectedText.includes(prompt));
+      else delete sourceFacts.originalPromptAvailable;
+    }
+    return [{
+      ...candidate,
+      contentHtml: selection.includeText
+        ? selectedAllText ? candidate.contentHtml : selectedHtml
+        : "",
+      contentText: hasTextBlockSelection ? selectedText : selection.includeText ? candidate.contentText : "",
+      textBlocks: selection.includeText ? selectedTextBlocks : [],
+      excerpt: selection.includeText
+        ? selectedAllText ? candidate.excerpt : selectedTextBlocks[0]?.text || ""
+        : "",
+      media: candidate.media.filter((item) => selectedMediaIds.has(item.id)).map(item => {
+        const { originalPrompt, ...media } = item;
+        return originalPrompt && selection.includeText && (selectedAllText || selectedText.includes(originalPrompt))
+          ? { ...media, originalPrompt } : media;
+      }),
+      sourceFacts,
+      articleDocument
+    }];
+  });
+}
+
+export function pageCaptureMediaDecisionsResolved(batchValue = {}) {
+  const batch = normalizePageCaptureBatch(batchValue);
+  return batch.selections.length > 0 && batch.selections.every((selection) => selection.mediaDecision !== "pending");
+}
+
+export function pageCaptureStructureMatches(referenceValue, candidateValue) {
+  const signature = (value) => {
+    const candidate = normalizePageCaptureCandidate(value);
+    if (!candidate) return null;
+    const articleKinds = new Set((candidate.articleDocument?.blocks || [])
+      .map((block) => block.kind)
+      .filter((kind) => !["heading", "link"].includes(kind)));
+    return {
+      hasText: Boolean(candidate.textBlocks.length || candidate.contentText),
+      articleKinds: [...articleKinds].sort(),
+      mediaKinds: [...new Set(candidate.media.map((media) => media.kind))].sort()
+    };
+  };
+  const reference = signature(referenceValue);
+  const candidate = signature(candidateValue);
+  return Boolean(reference && candidate
+    && reference.hasText === candidate.hasText
+    && reference.articleKinds.join("|") === candidate.articleKinds.join("|")
+    && reference.mediaKinds.join("|") === candidate.mediaKinds.join("|"));
+}
+
+function filterCandidateArticleDocument(value, selection) {
+  const documentValue = normalizeArticleDocument(value);
+  if (!documentValue) return null;
+  const selectedChildren = new Set(documentValue.blocks.filter(block => block.rows && selection.includeText && (selection.selectedAllText || selection.selectedTextBlockIds.has(block.id)))
+    .flatMap(block => block.rows.flatMap(row => row.flatMap(cell => cell.blockIds))));
+  return normalizeArticleDocument({
+    ...documentValue,
+    blocks: documentValue.blocks.filter((block) => {
+      if (["image", "video", "document", "attachment"].includes(block.kind)) return selection.selectedMediaIds.has(block.assetId);
+      if (block.kind === "link") return true;
+      return selection.includeText && (selection.selectedAllText || selection.selectedTextBlockIds.has(block.id) || selectedChildren.has(block.id));
+    })
+  });
+}
+
+export function normalizePageCaptureCandidate(value = {}) {
+  const canonicalUrl = safeUrl(value.canonicalUrl || value.url);
+  const capturedTitle = cleanCaptureImageDescription(value.title);
+  if (!canonicalUrl && !capturedTitle) return null;
+  const sourceFacts = normalizeSourceFacts(value.sourceFacts, canonicalUrl);
+  const title = capturedTitle || captureSourceLabel(canonicalUrl, sourceFacts);
+  const rawContentText = normalizeText(value.contentText);
+  const rawTextBlocks = normalizeTextBlocks(value.textBlocks, rawContentText, canonicalUrl);
+  const prepared = rawTextBlocks.some((item) => item.kind && item.kind !== "section")
+    ? prepareCreativeSections(rawTextBlocks, { canonicalUrl, title, sourceFacts, pageType: value.pageType })
+    : {
+        textBlocks: rawTextBlocks,
+        possibleOmissions: normalizeTextBlocks(value.possibleOmissions, "", canonicalUrl),
+        contentText: rawContentText,
+        contentHtml: String(value.contentHtml ?? "")
+      };
+  const textBlocks = prepared.textBlocks;
+  const contentText = prepared.contentText;
+  const media = suppressVideoPosterImages(uniqueMedia(value.media));
+  const mediaIds = new Set(media.map((item) => item.id));
+  const normalizedArticleDocument = normalizeArticleDocument(value.articleDocument);
+  const articleDocument = normalizedArticleDocument && normalizeArticleDocument({
+    ...normalizedArticleDocument,
+    blocks: normalizedArticleDocument.blocks.filter((block) => !block.assetId || mediaIds.has(block.assetId))
+  });
+  return {
+    id: clean(value.id) || stableCandidateId(canonicalUrl, title),
+    pageType: PAGE_TYPES.has(value.pageType) ? value.pageType : "generic",
+    title: title || hostname(canonicalUrl),
+    canonicalUrl,
+    contentHtml: prepared.contentHtml,
+    contentText,
+    textBlocks,
+    articleDocument,
+    possibleOmissions: prepared.possibleOmissions,
+    supplements: (Array.isArray(value.supplements) ? value.supplements : []).flatMap(item => {
+      const text = normalizeText(item?.text);
+      const sourceUrl = safeUrl(item?.sourceUrl);
+      return (text || item?.media?.length) && sourceUrl ? [{ id: clean(item.id) || stableCandidateId(sourceUrl, text), text, sourceUrl,
+        media: suppressVideoPosterImages(uniqueMedia(item.media)), partial: item.partial === true }] : [];
+    }),
+    batchStructureStatus: value.batchStructureStatus === "review" ? "review" : value.batchStructureStatus === "matched" ? "matched" : "",
+    region: normalizeCaptureRegion(value.region),
+    excerpt: clean(value.excerpt),
+    media,
+    sourceFacts,
+    completeness: COMPLETENESS.has(value.completeness) ? value.completeness : "partial",
+    extraction: {
+      scope: value.extraction?.scope === "selection" ? "selection" : "document",
+      method: ["selection", "readability", "structured", "page"].includes(value.extraction?.method)
+        ? value.extraction.method
+        : "page",
+      textBlockCount: textBlocks.length,
+      pendingMediaCount: positiveInteger(value.extraction?.pendingMediaCount, 0),
+      textTruncated: value.extraction?.textTruncated === true
+    },
+    adapter: clean(value.adapter) || "generic"
+  };
+}
+
+// Accessibility wrappers describe an image element, not the work's name.
+// Keep the supplied description, but never invent a subject for an untitled work.
+function cleanCaptureImageDescription(value) {
+  return clean(value).replace(/^(?:其中包括(?:图片)?|图片中可能包括|图像中可能包括)\s*[:：]\s*/u, "")
+    .replace(/^(?:image may contain|this may contain)\s*:?\s*/iu, "").trim();
+}
+
+function captureSourceLabel(url, facts) {
+  if (!url) return facts.provider;
+  const source = new URL(url);
+  const identity = facts.itemId || source.pathname.replace(/^\/+|\/+$/gu, "") || source.search;
+  return [facts.provider === "pinterest" ? "Pinterest" : source.hostname, identity].filter(Boolean).join(" · ");
+}
+
+function suppressVideoPosterImages(values) {
+  const posterIdentities = new Set(values
+    .filter((item) => item.kind === "video")
+    .map((item) => pageCaptureMediaIdentity(item.posterUrl) || item.posterUrl)
+    .filter(Boolean));
+  return values.filter((item) => item.isCover || item.kind !== "image" || !posterIdentities.has(pageCaptureMediaIdentity(item.url) || item.url));
+}
+
+function normalizeCaptureRegion(value = {}) {
+  value = value && typeof value === "object" ? value : {};
+  const marker = clean(value.marker);
+  if (!marker) return null;
+  return {
+    id: clean(value.id) || marker,
+    marker,
+    label: clean(value.label),
+    score: Number.isFinite(Number(value.score)) ? Number(value.score) : 0,
+    textLength: positiveInteger(value.textLength, 0),
+    mediaCount: positiveInteger(value.mediaCount, 0),
+    contentTargets: (Array.isArray(value.contentTargets) ? value.contentTargets : []).flatMap((target, index) => {
+      const path = clean(target?.path);
+      const kind = ["text", "image", "video", "document", "attachment", "group"].includes(target?.kind) ? target.kind : "";
+      if (!path || !kind) return [];
+      return [{
+        id: clean(target.id) || `target:${index}`,
+        kind,
+        path,
+        groupId: clean(target.groupId),
+        articleBlockIds: [...new Set((Array.isArray(target.articleBlockIds) ? target.articleBlockIds : []).map(clean).filter(Boolean))],
+        mediaIds: [...new Set((Array.isArray(target.mediaIds) ? target.mediaIds : []).map(clean).filter(Boolean))],
+        sourceOrder: Number.isSafeInteger(Number(target.sourceOrder)) ? Number(target.sourceOrder) : index
+      }];
+    }),
+    edits: (Array.isArray(value.edits) ? value.edits : []).flatMap((edit) => {
+      const path = clean(edit?.path);
+      const mode = edit?.mode === "exclude" ? "exclude" : edit?.mode === "include" ? "include" : "";
+      return path && mode ? [{ mode, path }] : [];
+    })
+  };
+}
+
+function normalizeTextBlocks(values, contentText, canonicalUrl) {
+  const provided = (Array.isArray(values) ? values : []).flatMap((value, index) => {
+    const text = normalizeText(typeof value === "string" ? value : value?.text);
+    if (!text) return [];
+    const kind = ["heading", "paragraph", "list", "quote", "code", "figure", "table", "noise", "section"].includes(value?.kind) ? value.kind : "";
+    const hasSourceOrder = Number.isSafeInteger(Number(value?.sourceOrder));
+    return [{
+      id: clean(value?.id) || stableCandidateId(canonicalUrl, `${index}\n${text}`),
+      text,
+      html: String(typeof value === "string" ? "" : value?.html ?? ""),
+      ...(kind ? { kind } : {}),
+      ...(value?.relevance === "explicit-creative" ? { relevance: "explicit-creative" } : {}),
+      ...(clean(value?.reason) ? { reason: clean(value.reason) } : {}),
+      ...(Number.isFinite(Number(value?.score)) ? { score: Number(value.score) } : {}),
+      ...(hasSourceOrder ? { sourceOrder: Number(value.sourceOrder) } : {})
+    }];
+  });
+  if (provided.length) return provided;
+  return normalizeText(contentText).split(/\n\s*\n/g).flatMap((text, index) => {
+    const normalized = normalizeText(text);
+    return normalized ? [{ id: stableCandidateId(canonicalUrl, `${index}\n${normalized}`), text: normalized, html: "" }] : [];
+  });
+}
+
+function prepareCreativeSections(blocks, context) {
+  const sourceBlocks = blocks
+    .map((block, index) => ({ ...block, sourceOrder: Number.isSafeInteger(block.sourceOrder) ? block.sourceOrder : index }))
+    .sort((left, right) => left.sourceOrder - right.sourceOrder);
+  const omitted = [];
+  const sections = [];
+  let current = null;
+  const flush = () => {
+    if (!current?.blocks.length) return;
+    const text = current.blocks.map((item) => item.text).join("\n");
+    const html = current.blocks.map((item) => item.html).join("");
+    const promptLike = current.blocks.some((item) => item.relevance === "explicit-creative") || isPromptSection(text);
+    const item = {
+      id: stableCandidateId(context.canonicalUrl, `section\n${current.sourceOrder}\n${text}`),
+      text,
+      html,
+      kind: "section",
+      sourceOrder: current.sourceOrder,
+      relevance: promptLike ? "explicit-creative" : "general-content",
+      score: (promptLike ? 1_000_000 : 0) + [...text].length
+    };
+    if (context.pageType === "article" || promptLike || [...text].length >= PAGE_CAPTURE_QUALITY_LIMITS.minOrdinarySectionCharacters) sections.push(item);
+    else omitted.push({ ...item, reason: "short-or-uncertain" });
+    current = null;
+  };
+
+  for (const block of sourceBlocks) {
+    if (block.relevance !== "explicit-creative" && (block.text === context.title || block.text === context.sourceFacts.author)) continue;
+    if (block.kind === "noise") {
+      flush();
+      omitted.push({ ...block, reason: "page-chrome" });
+      continue;
+    }
+    if (block.kind === "heading") {
+      flush();
+      current = { sourceOrder: block.sourceOrder, blocks: [block] };
+      continue;
+    }
+    if (!current) current = { sourceOrder: block.sourceOrder, blocks: [] };
+    current.blocks.push(block);
+  }
+  flush();
+
+  const textBlocks = context.pageType === "article" ? sections : sections
+    .sort((left, right) => right.score - left.score || left.sourceOrder - right.sourceOrder)
+    .slice(0, PAGE_CAPTURE_QUALITY_LIMITS.maxCreativeSections);
+  const retained = [...textBlocks].sort((left, right) => left.sourceOrder - right.sourceOrder);
+  return {
+    textBlocks,
+    possibleOmissions: omitted
+      .sort((left, right) => [...right.text].length - [...left.text].length || left.sourceOrder - right.sourceOrder)
+      .slice(0, PAGE_CAPTURE_QUALITY_LIMITS.maxPossibleOmissions),
+    contentText: retained.map((item) => item.text).join("\n\n"),
+    contentHtml: retained.every((item) => item.html) ? retained.map((item) => item.html).join("") : ""
+  };
+}
+
+function isPromptSection(value) {
+  return /(?:^|\n)\s*(?:prompt|negative prompt|system prompt|提示词|反向提示词|项目\s*brief|creative brief|brief|创作说明)\s*[:：]?\s*(?:\n|$)/iu.test(String(value || ""));
+}
+
+export function normalizeSourceFacts(value = {}, canonicalUrl = "") {
+  const engagement = Object.fromEntries(Object.entries(value.engagement || {}).flatMap(([key, amount]) => {
+    const number = Number(amount);
+    return clean(key) && Number.isFinite(number) && number >= 0 ? [[clean(key), number]] : [];
+  }));
+  const capturedAt = validIso(value.capturedAt) || new Date().toISOString();
+  return {
+    provider: clean(value.provider) || hostname(canonicalUrl),
+    ...(value.description ? { description: normalizeText(value.description) } : {}),
+    ...(typeof value.originalPromptAvailable === "boolean" ? { originalPromptAvailable: value.originalPromptAvailable } : {}),
+    ...(value.caseOriginalPromptAvailable === true ? { caseOriginalPromptAvailable: true } : {}),
+    ...(value.codePreviewAvailable === true ? { codePreviewAvailable: true } : {}),
+    ...(value.codeSourceAvailable === true ? { codeSourceAvailable: true } : {}),
+    ...(Array.isArray(value.captureSourceSelectors) ? { captureSourceSelectors: [...new Set(value.captureSourceSelectors.filter(item => typeof item === 'string' && item))] } : {}),
+    pageType: PAGE_TYPES.has(value.pageType) ? value.pageType : "generic",
+    itemId: clean(value.itemId),
+    authorUrl: safeUrl(value.authorUrl),
+    originalSourceUrl: safeUrl(value.originalSourceUrl),
+    imageDescription: clean(value.imageDescription),
+    metadataError: clean(value.metadataError),
+    author: clean(value.author),
+    handle: clean(value.handle),
+    publishedAt: validIso(value.publishedAt),
+    capturedAt,
+    model: clean(value.model),
+    dimensions: clean(value.dimensions),
+    duration: clean(value.duration),
+    license: clean(value.license),
+    engagement,
+    engagementObservedAt: Object.keys(engagement).length
+      ? validIso(value.engagementObservedAt) || capturedAt
+      : "",
+    captureScope: value.captureScope === "selection" ? "selection" : "document",
+    extractionMethod: ["selection", "readability", "structured", "page"].includes(value.extractionMethod)
+      ? value.extractionMethod
+      : "page",
+    status: value.status === "complete" ? "complete" : "partial"
+  };
+}
+
+export function pageCapturePermissionOrigins(candidates = []) {
+  const origins = new Set();
+  for (const candidate of candidates) {
+    for (const media of normalizePageCaptureCandidate(candidate)?.media || []) {
+      if (media.localAssetId || media.kind === "document" && !isSupportedDocumentMimeType(media.mimeType)) continue;
+      for (const value of [media.posterUrl, media.streamUrl, ...pageCaptureMediaFetchCandidates(media)]) {
+        try {
+          const url = new URL(value);
+          if (["http:", "https:"].includes(url.protocol)) origins.add(`${url.origin}/*`);
+        } catch {
+        }
+      }
+    }
+  }
+  return [...origins].sort();
+}
+
+export function pageCaptureMediaFetchCandidates(value = {}) {
+  return normalizeMediaVariants(value).map((variant) => variant.url);
+}
+
+export async function resolvePageCaptureImage(mediaValue = {}, options = {}) {
+  if (typeof options.fetchMedia !== "function" || typeof options.decodeDataUrl !== "function") {
+    throw new Error("网页媒体解析器缺少下载能力");
+  }
+  const failures = [];
+  const variants = normalizeMediaVariants(mediaValue);
+  const urls = variants.map(variant => variant.url);
+  const originals = variants.filter(variant => variant.sourceKind === "site-original").map(variant => variant.url);
+  // Try originals through the allowed page session before accepting preview renditions.
+  const groups = originals.length ? [originals, urls.filter(url => !originals.includes(url))] : [urls];
+  for (const group of groups) {
+    for (const url of group) {
+      try {
+        const downloaded = await options.fetchMedia(url);
+        const blob = downloaded?.blob instanceof Blob ? downloaded.blob : downloaded;
+        return { blob, metadata: downloaded?.metadata || null, sourceUrl: url, captureMethod: "source", usedPixelFallback: false,
+          usedReducedImage: originals.length > 0 && !originals.includes(url), failures };
+      } catch (error) {
+        options.signal?.throwIfAborted();
+        failures.push({ url, message: String(error?.message || error) });
+      }
+    }
+    if (options.sessionMediaAllowed !== false && typeof options.fetchSessionMedia === "function") {
+      for (const url of group) {
+        try {
+          const downloaded = await options.fetchSessionMedia(url);
+          const blob = downloaded?.blob instanceof Blob ? downloaded.blob : downloaded;
+          return { blob, metadata: downloaded?.metadata || null, sourceUrl: url, captureMethod: "page-session", usedPixelFallback: false,
+            usedReducedImage: originals.length > 0 && !originals.includes(url), failures };
+        } catch (error) {
+          options.signal?.throwIfAborted();
+          failures.push({ url, method: "page-session", message: String(error?.message || error) });
+        }
+      }
+    }
+  }
+  const dataUrl = safeImageDataUrl(mediaValue.dataUrl || mediaValue.previewDataUrl);
+  if (dataUrl) {
+    try {
+      const sessionBytes = mediaValue.captureMethod === "page-session" && Boolean(mediaValue.dataUrl);
+      return { blob: await options.decodeDataUrl(dataUrl), sourceUrl: "", captureMethod: sessionBytes ? "page-session" : "pixel-fallback", usedPixelFallback: !sessionBytes, failures };
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      failures.push({ url: "pixel-fallback", message: String(error?.message || error) });
+    }
+  }
+  const reason = [...new Set(failures.map((item) => item.message))].join("；") || "没有可用的图片来源";
+  throw new Error(reason);
+}
+
+export function readPageCaptureInjectionResult(injected) {
+  const error = injected?.error || injected?.result?.captureError;
+  if (error) throw Object.assign(new Error(error.message || "网页扫描失败；当前草稿已保留"), { code: error.code || "PAGE_CAPTURE_FAILED" });
+  if (!injected?.result || typeof injected.result !== "object") {
+    throw new Error("网页扫描未返回结果，请重新扫描；当前草稿已保留");
+  }
+  return injected.result;
+}
+
+export async function collectPageCaptureSnapshot(options = {}) {
+  function clean(value) {
+    return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  }
+  const capturedAt = new Date().toISOString();
+  const sessionId = clean(options.sessionId);
+  let cancelled = false;
+  let scanIncomplete = false;
+  const cancellation = new AbortController();
+  const handleCaptureMessage = (message, _sender, sendResponse) => {
+    if (message?.type !== "PROMPTDIRECTOR_PAGE_CAPTURE" || message.sessionId !== sessionId) return undefined;
+    if (message.action === "cancel") {
+      cancelled = true;
+      cancellation.abort();
+      sendResponse({ ok: true, sessionId, cancelled: true });
+      return false;
+    }
+    return undefined;
+  };
+  if (sessionId) globalThis.chrome?.runtime?.onMessage?.addListener?.(handleCaptureMessage);
+  const maxCandidates = positiveInteger(options.maxCandidates, 100);
+  let maxMedia = positiveInteger(options.maxMedia, Number.MAX_SAFE_INTEGER);
+  const maxInlinePixelDataCharacters = positiveInteger(options.maxInlinePixelDataCharacters, 32 * 1024 * 1024);
+  let inlinePixelCharacters = 0;
+  function reserveInlinePixels(dataUrl) {
+    inlinePixelCharacters += dataUrl.length;
+    if (inlinePixelCharacters > maxInlinePixelDataCharacters) throw Object.assign(new Error('本次采集的像素传输超过工作预算；页面原件保留，请分批选择'), { code: 'RESOURCE_BUDGET_REACHED' });
+    return dataUrl;
+  }
+  let genericCapture = false;
+  let genericRoot = null;
+  let hiddenGenericNodes = new WeakMap();
+  let wholePage = options.mode === "whole";
+  const originalScroll = { x: window.scrollX, y: window.scrollY };
+  let xSourceScroll = null;
+  let selectedTemplateNode = null;
+  const selectedContentErrors = [];
+
+  // Reuse the rendered component tree within each scan pass. Slots carry the
+  // assigned content once; unassigned light DOM is not visible page content.
+  let renderedTreeCache = new WeakMap();
+  function renderedElements(root) {
+    if (renderedTreeCache.has(root)) return renderedTreeCache.get(root);
+    const result = [];
+    const seen = new Set();
+    const visit = node => {
+      if (seen.has(node)) return;
+      seen.add(node);
+      if (node instanceof Element) result.push(node);
+      const children = node.localName === 'slot'
+        ? node.assignedNodes({ flatten: true }) : (node.shadowRoot || node).childNodes;
+      for (const child of children || []) visit(child);
+    };
+    const children = root.shadowRoot ? root.shadowRoot.childNodes : root.childNodes;
+    for (const child of children || []) visit(child);
+    renderedTreeCache.set(root, result);
+    return result;
+  }
+  function renderedQueryAll(root, selector) {
+    return renderedElements(root).filter(node => node.matches(selector));
+  }
+  function composedParent(node) {
+    return node?.assignedSlot || node?.parentElement || node?.getRootNode?.().host || null;
+  }
+  function composedClosest(node, selector) {
+    for (let current = node; current; current = composedParent(current)) {
+      if (current.matches?.(selector)) return current;
+    }
+    return null;
+  }
+
+  try {
+    // A full-page Cloudflare challenge exposes both markers. A normal page
+    // with an embedded Turnstile widget remains eligible for capture.
+    if (document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]')
+      && [...document.scripts].some(script => script.textContent.includes('_cf_chl_opt'))) {
+      throw Object.assign(new Error('网页正在进行安全验证，请在原网页完成后重新采集；当前草稿已保留'), { code: 'CAPTURE_ACCESS_REQUIRED' });
+    }
+    if (options.listMode && options.selectionTemplate) {
+      const template = options.selectionTemplate;
+      selectedTemplateNode = [...document.querySelectorAll('[data-promptdirector-capture-template]')]
+        .find(node => node.getAttribute('data-promptdirector-capture-template') === template.marker);
+      if (selectedTemplateNode && template.mediaSources?.length) {
+        selectedTemplateNode = templateMediaPeers(selectedTemplateNode)
+          .find(node => templateMediaSources(node).some(source => template.mediaSources.includes(source)));
+      }
+      if (template.sourceUrl !== location.href || !template.marker || !selectedTemplateNode || detectAdapter(location.hostname).id !== 'generic') {
+        throw Object.assign(new Error('手选范围已失效，请在当前页面重新选择一个案例'), { code: 'CAPTURE_TEMPLATE_EXPIRED' });
+      }
+    }
+    if (options.manualContentHtml) {
+      genericCapture = detectAdapter(location.hostname).id === "generic";
+      const root = document.createElement("div");
+      root.innerHTML = options.manualContentHtml;
+      maxMedia = Math.max(maxMedia, root.querySelectorAll("img,video,iframe,canvas").length);
+      let selectedMedia;
+      if (options.selectedContentMarker) {
+        const selected = document.querySelector(`[data-promptdirector-selected-content="${CSS.escape(String(options.selectedContentMarker))}"]`) || renderedQueryAll(document, '[data-promptdirector-selected-content]')
+          .find(node => node.getAttribute('data-promptdirector-selected-content') === options.selectedContentMarker);
+        if (!selected) throw new Error('手选内容已经变化，请重新选择；当前草稿保留');
+        try { selectedMedia = collectMedia(selected, maxMedia, true); }
+        finally { selected.removeAttribute('data-promptdirector-selected-content'); }
+      }
+      const candidate = candidateForRoot(root, 0, {
+        adapter: { id: "generic", fields: {} }, metadata: { title: document.title }, structured: [],
+        article: null, siteData: null, canonicalUrl: location.href, pageType: root.querySelector("article,main") ? "article" : root.querySelector("video,iframe") ? "video" : root.querySelector("img") ? "artwork" : "article", maxMedia,
+        contentRoot: root, pageRoot: root, selectedMedia
+      });
+      if (candidate) {
+        candidate.title = document.title;
+        candidate.id = `manual:${sessionId}`;
+        candidate.region = null;
+        candidate.sourceFacts.captureScope = "selection";
+        candidate.extraction.scope = "selection";
+        candidate.textBlocks = candidate.textBlocks.map(block => ({ ...block, kind: "section" }));
+        candidate.contentText = candidate.textBlocks.map(block => block.text).join("\n\n");
+        if (selectedContentErrors.length) {
+          candidate.completeness = 'partial';
+          candidate.sourceFacts.status = 'partial';
+        }
+        const ids = new Map(candidate.media.map(item => [item.id, `${candidate.id}:${item.id}`]));
+        candidate.media = candidate.media.map(item => ({ ...item, id: ids.get(item.id) }));
+        candidate.articleDocument.blocks = candidate.articleDocument.blocks.map(block => ({ ...block, assetId: ids.get(block.assetId) || block.assetId }));
+      }
+      return { id: sessionId, sourceUrl: location.href, adapter: "generic", selectionTemplate: genericCapture ? options.selectionTemplate : null, candidates: candidate ? [candidate] : [], capturedAt,
+        ...(selectedContentErrors.length ? { error: [...new Set(selectedContentErrors)].join('；') } : {}) };
+    }
+    if (options.xSupplementUrl) return { supplement: await readXSupplement(options.xSupplementUrl) };
+    const editedRegion = options.editedRegion && typeof options.editedRegion === "object" ? options.editedRegion : null;
+    const editedBaseRoot = editedRegion?.marker
+      ? [...document.querySelectorAll?.("[data-promptdirector-capture-region]") || []]
+        .find((element) => element.getAttribute?.("data-promptdirector-capture-region") === clean(editedRegion.marker))
+      : null;
+    const editedRoot = editedBaseRoot && clean(editedRegion?.token)
+      ? buildEditedRegionRoot(editedBaseRoot, clean(editedRegion.token))
+      : null;
+    for (const element of document.querySelectorAll?.("[data-promptdirector-capture-region]") || []) {
+      element.removeAttribute?.("data-promptdirector-capture-region");
+    }
+    const adapter = detectAdapter(location.hostname);
+    const assetDetail = options.siteData?.adapter === "higgsfield" && options.siteData?.captureScope === "asset";
+    const declaredContent = (assetDetail ? [] : adapter.fields?.content || []).map(selector => document.querySelector(selector)).find(Boolean);
+    if (declaredContent) maxMedia = Math.max(maxMedia, declaredContent.querySelectorAll("img,video").length);
+    const pendingContentMedia = (options.feishuDocument ? 0 : await prepareArticleImages(declaredContent)) + (assetDetail ? 0 : await prepareContentMedia(adapter)) + (Number(options.downloads?.failures) || 0) + (Number(options.feishuDocument?.pendingMediaCount) || 0);
+    const canonicalUrl = (adapter.id === "x" && xPostCanonicalUrl(location.href))
+      || safeHttpUrl(document.querySelector('link[rel="canonical"]')?.href || location.href);
+    const metadata = collectMetadata();
+    const structured = collectStructuredData();
+    const siteData = options.siteData && typeof options.siteData === "object" ? options.siteData : null;
+    const pageSelection = options.mode === "whole" ? null : collectPageSelection();
+    let contentRoot = !pageSelection
+      ? (adapter.fields?.content || []).map((selector) => document.querySelector(selector))
+        .find((element) => cleanBlockText(element?.innerText)) || null
+      : null;
+    if (adapter.id === "feishu" && options.feishuDocument?.html && !pageSelection) {
+      contentRoot = document.createElement("div");
+      contentRoot.innerHTML = options.feishuDocument.html;
+    }
+    // A known document route without its body must not turn navigation into a case.
+    const requiresContentRoot = adapter.id === "feishu" || (adapter.fields?.contentRequiredPathPrefixes || []).some(prefix => location.pathname.startsWith(prefix));
+    if (requiresContentRoot && !contentRoot && !pageSelection && !editedRoot) {
+      return { id: sessionId, sourceUrl: canonicalUrl, adapter: adapter.id, candidates: [], capturedAt, siteStatus: "partial" };
+    }
+    if (editedRoot) {
+      genericCapture = adapter.id === "generic";
+      const article = adapter.id === "x" ? null : readArticle();
+      const pageType = detectPageType({ adapter, metadata, structured, article, cardCount: 0 });
+      const candidate = candidateForRoot(editedRoot, 0, {
+        adapter, metadata, structured, article: null, siteData: null, canonicalUrl, pageType, maxMedia
+      });
+      if (candidate) candidate.region = editedRegion.region || null;
+      editedBaseRoot.setAttribute?.("data-promptdirector-capture-region", clean(editedRegion.marker));
+      return { id: sessionId, sourceUrl: canonicalUrl, adapter: adapter.id, candidates: candidate ? [candidate] : [], capturedAt };
+    }
+    if (siteData?.pageKind === "feed") {
+      if (wholePage && !(siteData.adapter === "jimeng" && (siteData.candidates?.length || 0) >= maxCandidates)) await scanLoadedPage(() => undefined);
+      return {
+        id: sessionId,
+        sourceUrl: canonicalUrl,
+        adapter: adapter.id,
+        candidates: Array.isArray(siteData.candidates) ? siteData.candidates.slice(0, maxCandidates) : [],
+        capturedAt,
+        siteStatus: siteData.completeness === "complete" ? "complete" : "partial"
+      };
+    }
+    if ((assetDetail || ["jimeng", "youtube", "bilibili", "douyin", "midjourney", "pinterest"].includes(siteData?.adapter)) && siteData.pageKind === "detail" && !pageSelection) {
+      return {
+        id: sessionId, sourceUrl: canonicalUrl, adapter: adapter.id,
+        candidates: Array.isArray(siteData.candidates) ? siteData.candidates.slice(0, 1) : [],
+        capturedAt, siteStatus: siteData.completeness === "complete" ? "complete" : "partial"
+      };
+    }
+    // Structured feeds and works above already own their complete capture result.
+    // Only the remaining paths use article extraction for classification or text.
+    const article = adapter.id === "x" ? null : readArticle();
+    if (adapter.id === "x" && !pageSelection) {
+      // Let the current render commit its thread nodes; decoding photos is
+      // unnecessary and would stall a long post whose media is far offscreen.
+      let thread = xThreadRoot();
+      const deadline = Date.now() + positiveInteger(options.mediaTimeoutMs, 1200);
+      let posts = [...thread.querySelectorAll('article')].filter(post => ownPostLinks(post).length);
+      let current = posts.find(post => ownPostLinks(post).some(link => xPostIdentity(link.href) === xPostIdentity(canonicalUrl)));
+      if (!current && xPostIdentity(canonicalUrl)) {
+        let scrollRoot = null;
+        for (let node = posts[0]?.parentElement || thread; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+          if (node.scrollHeight > node.clientHeight && /auto|scroll/u.test(getComputedStyle(node).overflowY)) { scrollRoot = node; break; }
+        }
+        xSourceScroll = { target: scrollRoot || window, top: scrollRoot ? scrollRoot.scrollTop : window.scrollY, left: scrollRoot ? scrollRoot.scrollLeft : window.scrollX };
+        xSourceScroll.target.scrollTo({ top: 0, behavior: "instant" });
+        current = await waitForXPost(xPostIdentity(canonicalUrl), deadline);
+        thread = xThreadRoot();
+      }
+      await waitForScrollRender(current || thread, isXContentMutation, Math.max(1, deadline - Date.now()));
+      posts = [...thread.querySelectorAll('article')].filter(post => ownPostLinks(post).length);
+      if (current || !wholePage) {
+        const roots = current ? [current] : posts;
+        const candidates = roots.slice(0, maxCandidates).flatMap((root, index) => {
+          const candidate = candidateForRoot(root, index, {
+            adapter, metadata, structured: [], article: null, siteData: null,
+            canonicalUrl, pageType: "post", maxMedia
+          });
+          return candidate ? [candidate] : [];
+        });
+        if (current && candidates[0]) {
+          candidates[0].supplements = await collectXAuthorThread(current, adapter, thread, canonicalUrl, deadline);
+          if (scanIncomplete) {
+            candidates[0].completeness = "partial";
+            candidates[0].sourceFacts.status = "partial";
+          }
+        }
+        return { id: sessionId, sourceUrl: canonicalUrl, adapter: adapter.id, candidates, capturedAt };
+      }
+    }
+    // Only unadapted pages use this document path. Dedicated adapters and manual
+    // selections retain their existing roots, visibility rules and loading flow.
+    genericCapture = adapter.id === "generic" && !siteData && !pageSelection && !editedRoot;
+    const template = genericCapture && options.listMode && options.selectionTemplate
+      ? createSelectionTemplatePlan() : null;
+    if (template) contentRoot = null;
+    if (genericCapture && options.genericGroupingRequested) wholePage = true;
+    if (genericCapture && !options.listMode) {
+      const mains = [...document.querySelectorAll("main,[role=main]")]
+        .filter(node => !isPageChrome(node) && !genericNodeHidden(node));
+      const outer = mains.filter(node => !mains.some(other => other !== node && other.contains(node)));
+      if (outer.length === 1 && !outer[0].querySelector("article,[role=document]")
+        && outer[0].querySelector("h1,h2,p,img,video,iframe,canvas")
+        && ([...outer[0].querySelectorAll("h1")].some(heading => !heading.closest("a[href]"))
+          || !outer[0].querySelector("a[href]"))) {
+        genericRoot = outer[0];
+        contentRoot = genericRoot;
+      }
+    }
+    // A single semantic article is a document, not a feed of its paragraphs.
+    const semanticArticles = !template && !contentRoot && !siteData && !pageSelection && adapter.id === "generic"
+      ? [...document.querySelectorAll("main article,[role=main] article,article[role=document],[role=document]")]
+        .filter(node => (node.matches("[role=document]") || node.querySelector("h1")) && !node.closest("nav,aside,[role=navigation],[role=complementary]") && !node.parentElement?.closest("article,[role=document]"))
+      : [];
+    let documentRoot = semanticArticles.length === 1 ? semanticArticles[0] : null;
+    if (documentRoot && !wholePage) {
+      let internalScroll = false;
+      for (let node = documentRoot; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+        if (node.scrollHeight > node.clientHeight && /auto|scroll/u.test(getComputedStyle(node).overflowY)) { internalScroll = true; break; }
+      }
+      if (!internalScroll) documentRoot = null;
+    }
+    if (documentRoot) contentRoot = documentRoot;
+    const documentParts = new Map();
+    const documentNodes = new WeakMap();
+    let documentSequence = 0;
+    const collectDocumentParts = () => {
+      if (!documentRoot) return;
+      const selector = "h1,h2,h3,h4,h5,h6,p,ul,ol,blockquote,pre,table,figure,img,video";
+      if ([...documentParts.values()].some(part => !part.identity && !part.node.isConnected)) scanIncomplete = true;
+      for (const node of documentRoot.querySelectorAll(selector)) {
+        if (isPageChrome(node) || node.parentElement?.closest(selector)) continue;
+        const identity = node.id || node.getAttribute("data-block-id") || node.getAttribute("data-record-id");
+        let key = identity ? `${node.tagName}:${identity}` : documentNodes.get(node);
+        if (!key) { key = `node:${documentSequence++}`; documentNodes.set(node, key); }
+        const previous = documentParts.get(key);
+        // Without a stable ID, detached/recycled blocks cannot prove document continuity.
+        if (previous && !identity && previous.text !== node.textContent) scanIncomplete = true;
+        const rect = node.getBoundingClientRect();
+        let offset = 0;
+        for (let parent = node.parentElement; parent && parent !== documentRoot.parentElement; parent = parent.parentElement) offset += parent.scrollTop;
+        const clone = node.cloneNode(true);
+        // Resolve relative and lazy image URLs before the live node disappears.
+        const sourceImages = node.matches("img") ? [node] : [...node.querySelectorAll("img")];
+        const clonedImages = clone.matches("img") ? [clone] : [...clone.querySelectorAll("img")];
+        sourceImages.forEach((image, index) => {
+          const url = collectImageVariants(image)[0]?.url || safeHttpUrl(image.currentSrc || image.src);
+          if (url) clonedImages[index].setAttribute("src", url);
+          else scanIncomplete = true;
+        });
+        if (previous && node.matches("table") && previous.text !== node.textContent) scanIncomplete = true;
+        documentParts.set(key, { identity, node, text: node.textContent, html: clone.outerHTML,
+          top: rect.top - documentRoot.getBoundingClientRect().top + offset, left: rect.left,
+          order: previous?.order ?? documentParts.size });
+      }
+    };
+    const accumulated = new Map();
+    const collectVisible = () => {
+      if (contentRoot || siteData?.pageKind === "detail") return [];
+      const current = [];
+      const pinRoots = adapter.id === "pinterest" && !/^\/pin\//u.test(location.pathname) ? [...document.querySelectorAll('[data-test-id="pinWrapper"]')] : [];
+      const adapterRoots = template ? [] : pinRoots.length ? pinRoots : adapter.cardSelectors.flatMap((selector) => [...document.querySelectorAll(selector)]);
+      const repeatedRoots = template || adapterRoots.length > 1 || pinRoots.length ? [] : collectRepeatedCardRoots(maxCandidates);
+      const cardRoots = template ? selectionTemplateRoots(template) : [...adapterRoots, ...repeatedRoots];
+      const roots = template ? cardRoots : [...new Set(cardRoots)].filter(isContentRoot);
+      const pageType = detectPageType({ adapter, metadata, structured, article, cardCount: roots.length });
+      for (const [index, root] of roots.entries()) {
+        const candidate = candidateForRoot(root, index, {
+          adapter, metadata, structured, article: null, siteData: null, canonicalUrl,
+          pageType: options.listMode || pinRoots.length ? "gallery" : pageType, maxMedia, templateCard: template?.cards.get(root)
+        });
+        if (candidate) current.push(candidate);
+      }
+      return current;
+    };
+    const collectVisibleWithFallbacks = async () => {
+      hiddenGenericNodes = new WeakMap();
+      renderedTreeCache = new WeakMap();
+      collectDocumentParts();
+      const current = collectVisible();
+      await attachViewportFallbacks(current);
+      for (const candidate of current) {
+        if (accumulated.has(candidate.id) || accumulated.size < maxCandidates) accumulated.set(candidate.id, candidate);
+      }
+      return accumulated.size;
+    };
+    await collectVisibleWithFallbacks();
+    if (wholePage || documentRoot) await scanLoadedPage(collectVisibleWithFallbacks, contentRoot);
+    if (!documentRoot) await collectVisibleWithFallbacks();
+    if (documentRoot && documentParts.size) {
+      contentRoot = document.createElement("div");
+      contentRoot.innerHTML = [...documentParts.values()].sort((a,b) => a.top-b.top || a.left-b.left || a.order-b.order).map(part => part.html).join("\n");
+    }
+    const documentMediaLimit = documentRoot ? Math.max(maxMedia, contentRoot.querySelectorAll("img,video").length) : maxMedia;
+    const capturedCards = [...accumulated.values()];
+    const pageType = detectPageType({ adapter, metadata, structured, article, cardCount: capturedCards.length });
+    const pageRoot = contentRoot || document.body;
+    const scopedPost = !options.listMode && !pageSelection && !contentRoot && pageType === "post"
+      ? capturedCards.filter(candidate => candidate.title === cleanText(document.querySelector("h1")?.textContent)) : [];
+    const bodyCandidate = template || scopedPost.length === 1 ? null : candidateForRoot(pageRoot, 0, {
+      adapter, metadata, structured, article: contentRoot ? null : article, siteData, pageSelection, canonicalUrl,
+      pageType: contentRoot ? adapter.fields?.contentPageType || "article" : siteData?.pageType || pageType, maxMedia: documentMediaLimit, pageRoot, contentRoot
+    });
+    if (bodyCandidate && documentRoot) {
+      bodyCandidate.region = markCaptureRegion(documentRoot, 0, bodyCandidate.contentText, bodyCandidate.media.length);
+      if (bodyCandidate.region) bodyCandidate.region.contentTargets = collectContentTargets(documentRoot,
+        bodyCandidate.articleDocument?.blocks || [], bodyCandidate.media);
+    }
+    if (bodyCandidate) await attachViewportFallbacks([bodyCandidate]);
+    const regionCandidates = scopedPost.length !== 1 && !template && !contentRoot && !siteData && !pageSelection && !["feed", "gallery"].includes(pageType)
+      ? collectSubjectRegionRoots(positiveInteger(options.maxRegionCandidates, 5)).flatMap((root, index) => {
+          const candidate = candidateForRoot(root, index, {
+            adapter, metadata, structured, article: null, siteData: null, canonicalUrl, pageType, maxMedia
+          });
+          return candidate ? [candidate] : [];
+        })
+      : [];
+    if (regionCandidates.length) await attachViewportFallbacks(regionCandidates);
+    const candidates = scopedPost.length === 1 ? scopedPost : template ? capturedCards.slice(0, maxCandidates) : capturedCards.length > 0 && (adapter.id === "pinterest" && !/^\/pin\//u.test(location.pathname) && !siteData && !pageSelection || capturedCards.length > 1 && (options.listMode || ["feed", "gallery"].includes(pageType)))
+      ? capturedCards.slice(0, maxCandidates)
+      : regionCandidates.length ? regionCandidates
+        : bodyCandidate ? [bodyCandidate] : capturedCards.slice(0, maxCandidates);
+    if (pendingContentMedia || scanIncomplete) {
+      for (const candidate of candidates) {
+        candidate.completeness = "partial";
+        candidate.sourceFacts.status = "partial";
+        candidate.extraction.pendingMediaCount = pendingContentMedia;
+      }
+    }
+    return {
+      id: sessionId,
+      sourceUrl: canonicalUrl,
+      adapter: adapter.id,
+      ...(template ? { selectionTemplate: options.selectionTemplate } : {}),
+      candidates,
+      capturedAt
+    };
+  } catch (error) {
+    // Chrome may resolve executeScript with a null result when the injected
+    // promise rejects. Carry the failure explicitly across that boundary.
+    if (!options.serializeErrors) throw error;
+    return { captureError: { message: error?.message || "网页扫描失败；当前草稿已保留", code: error?.code || "PAGE_CAPTURE_FAILED" } };
+  } finally {
+    if (xSourceScroll) xSourceScroll.target.scrollTo({ top: xSourceScroll.top, left: xSourceScroll.left, behavior: "instant" });
+    if (wholePage) window.scrollTo(originalScroll.x, originalScroll.y);
+    if (sessionId) globalThis.chrome?.runtime?.onMessage?.removeListener?.(handleCaptureMessage);
+  }
+
+  async function scanLoadedPage(collectVisible, contentHint = null) {
+    const maxSteps = positiveInteger(options.maxScrollSteps, 30);
+    let targetReached = false;
+    const feedRoot = options.siteData?.adapter === "jimeng" ? document.querySelector?.('[aria-label="Explore content"]') : null;
+    let scrollRoot = null;
+    const anchors = feedRoot ? [feedRoot] : contentHint?.isConnected ? [contentHint]
+      : [...document.querySelectorAll("main,[role=main]")].filter(node => !node.closest("nav,aside,[role=navigation],[role=complementary]"));
+    const roots = new Set();
+    if (!feedRoot && !contentHint) {
+      for (const main of [...anchors]) {
+        for (const node of main.querySelectorAll("article,[role=feed],[role=list]")) {
+          if (!node.closest("nav,aside,[role=navigation],[role=complementary]")) anchors.push(node);
+        }
+      }
+    }
+    for (const anchor of anchors) {
+      for (let element = feedRoot ? anchor.parentElement : anchor; element && element !== document.body && element !== document.documentElement; element = element.parentElement) {
+        if (element.scrollHeight > element.clientHeight && /auto|scroll/u.test(getComputedStyle(element).overflowY)) {
+          roots.add(element); break;
+        }
+      }
+    }
+    if (roots.size === 1) scrollRoot = [...roots][0];
+    else if (roots.size > 1) { scanIncomplete = true; return; }
+    const start = scrollRoot ? { top: scrollRoot.scrollTop, left: scrollRoot.scrollLeft } : null;
+    let stableRounds = 0;
+    let previousPosition = -1;
+    try {
+      if (!feedRoot) {
+        (scrollRoot || window).scrollTo({ top: 0, behavior: "instant" });
+        await waitForScrollRender(scrollRoot || document.body);
+        await waitForVisibleMedia();
+        await collectVisible();
+      }
+      for (let step = 0; (options.listMode || step < maxSteps) && stableRounds < 3 && !cancelled; step += 1) {
+        const height = scrollRoot ? scrollRoot.scrollHeight : Math.max(document.body?.scrollHeight || 0, document.documentElement.scrollHeight);
+        const viewport = Math.max(1, scrollRoot ? scrollRoot.clientHeight : Number(window.innerHeight) || 720);
+        const nextTop = Math.min(Math.max(0, height - viewport), Math.max(0, scrollRoot ? scrollRoot.scrollTop : window.scrollY) + Math.round(viewport * 0.85));
+        (scrollRoot || window).scrollTo({ top: nextTop, behavior: "instant" });
+        if (!feedRoot) await waitForScrollRender(scrollRoot || document.body);
+        await waitForVisibleMedia();
+        if (feedRoot?.getAttribute?.("aria-busy") === "true" && !cancelled) {
+          await new Promise((resolve, reject) => {
+            const finish = (error) => {
+              observer.disconnect();
+              clearTimeout(timer);
+              cancellation.signal.removeEventListener("abort", onAbort);
+              if (error) reject(error); else resolve();
+            };
+            const onAbort = () => finish();
+            const observer = new MutationObserver(() => {
+              if (feedRoot.getAttribute("aria-busy") !== "true") finish();
+            });
+            const timer = setTimeout(() => finish(new Error("即梦作品仍在加载，请稍后重新扫描")), positiveInteger(options.mediaTimeoutMs, 1200));
+            observer.observe(feedRoot, { attributes: true, attributeFilter: ["aria-busy"] });
+            cancellation.signal.addEventListener("abort", onAbort, { once: true });
+            if (feedRoot.getAttribute("aria-busy") !== "true" || cancelled) finish();
+          });
+        }
+        const collectedCount = await collectVisible();
+        if (options.listMode && collectedCount >= maxCandidates) { targetReached = true; break; }
+        if (feedRoot && [...feedRoot.querySelectorAll?.(".masonry-layout-item[data-index]") || []]
+          .some((element) => Number(element.getAttribute("data-index")) + 1 >= maxCandidates)) break;
+        const nextHeight = scrollRoot ? scrollRoot.scrollHeight : Math.max(document.body?.scrollHeight || 0, document.documentElement.scrollHeight);
+        const position = Math.max(0, Number(scrollRoot ? scrollRoot.scrollTop : window.scrollY) || 0);
+        stableRounds = position === previousPosition && position + viewport >= nextHeight ? stableRounds + 1 : 0;
+        previousPosition = position;
+      }
+      if (!feedRoot && ((!targetReached && stableRounds < 3) || cancelled)) scanIncomplete = true;
+    } finally {
+      if (scrollRoot) scrollRoot.scrollTo({ ...start, behavior: "instant" });
+    }
+  }
+
+  async function waitForScrollRender(root, relevant = () => true, timeoutMs = positiveInteger(options.mediaTimeoutMs, 1200)) {
+    if (typeof MutationObserver !== "function" || !root || cancelled) return;
+    await new Promise(resolve => {
+      let quiet;
+      let frame = null;
+      let framesReady = document.hidden || typeof requestAnimationFrame !== "function";
+      const finish = () => {
+        clearTimeout(quiet); clearTimeout(deadline);
+        if (frame !== null) cancelAnimationFrame(frame);
+        observer.disconnect();
+        document.removeEventListener("visibilitychange", visibilityChanged);
+        cancellation.signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      const changed = records => {
+        if (!framesReady) return;
+        if (records?.length && !records.some(relevant)) return;
+        clearTimeout(quiet); quiet = setTimeout(() => {
+        if (root.matches?.('[aria-busy="true"]') || root.querySelector?.('[aria-busy="true"]')) return;
+        // Timeline pagination matters; a buffering player is not a requirement
+        // for discovering the post's original-media URLs.
+        if (relevant === isXContentMutation && [...root.querySelectorAll('[role="progressbar"]')]
+          .some(node => {
+            const rect = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            return !node.closest('[data-testid="videoPlayer"],[data-testid="videoComponent"]')
+              && style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && Number(style.opacity) !== 0
+              && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight;
+          })) return;
+        finish();
+      }, 150); };
+      const visibilityChanged = () => {
+        if (!document.hidden || framesReady) return;
+        if (frame !== null) cancelAnimationFrame(frame);
+        frame = null; framesReady = true; changed();
+      };
+      const observer = new MutationObserver(changed);
+      observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["aria-busy"] });
+      // Hidden comment tabs do not paint. The same deadline and cancellation
+      // cover visible paint frames as well as DOM settling if visibility changes.
+      const deadline = setTimeout(() => { scanIncomplete = true; finish(); }, timeoutMs);
+      cancellation.signal.addEventListener("abort", finish, { once: true });
+      document.addEventListener("visibilitychange", visibilityChanged);
+      if (framesReady) changed();
+      else frame = requestAnimationFrame(() => {
+        frame = requestAnimationFrame(() => { frame = null; framesReady = true; changed(); });
+      });
+    });
+  }
+
+  async function prepareArticleImages(root) {
+    if (!root) return 0;
+    const images = [...root.querySelectorAll("img")];
+    // Loaded decorative data-URL icons have no downloadable HTTP source, but
+    // are already excluded from capture. Unloaded/broken images still need a
+    // chance to reveal their source; zero dimensions alone cannot exclude them.
+    const needsSource = image => !collectImageVariants(image).length
+      && !(image.complete && image.naturalWidth > 0 && image.naturalHeight > 0 && isExcludedMedia(image));
+    const pending = images.filter(needsSource);
+    if (!pending.length) return 0;
+    const positions = [];
+    for (let node = root; node; node = node.parentElement) positions.push({node,top:node.scrollTop,left:node.scrollLeft});
+    const windowPosition = {left:window.scrollX,top:window.scrollY};
+    try {
+      for (const image of pending) {
+        if (cancelled) break;
+        image.scrollIntoView({block:"center",inline:"nearest",behavior:"instant"});
+        await waitForScrollRender(root);
+        await waitForVisibleMedia();
+      }
+    } finally {
+      for (const {node,top,left} of positions) node.scrollTo?.({top,left,behavior:"instant"});
+      window.scrollTo({...windowPosition,behavior:"instant"});
+    }
+    return images.filter(needsSource).length;
+  }
+
+  async function prepareContentMedia(adapter) {
+    const root = (adapter.fields?.content || []).map((selector) => document.querySelector(selector)).find(Boolean);
+    if (!root || !adapter.fields?.mediaContainers?.length || typeof MutationObserver !== "function") return 0;
+    const containers = [...new Set(adapter.fields.mediaContainers.flatMap((selector) => [...root.querySelectorAll(selector)]))];
+    const ready = (element) => Boolean(element.querySelector('img[src],video[src],video source[src],iframe[src],a[href]')
+      || (adapter.fields.downloadButtons && element.querySelector('button[aria-label="Download file"]')));
+    const pending = containers.filter((element) => !ready(element));
+    if (!pending.length) return 0;
+    const positions = [];
+    for (let element = root; element; element = element.parentElement) {
+      positions.push({ element, top: element.scrollTop, left: element.scrollLeft });
+    }
+    const position = { x: window.scrollX, y: window.scrollY };
+    const deadline = Date.now() + positiveInteger(options.mediaTimeoutMs, 1200);
+    try {
+      for (const element of pending.slice(0, maxMedia)) {
+        if (cancelled || Date.now() >= deadline) break;
+        if (ready(element)) continue;
+        element.scrollIntoView({ block: "center", behavior: "instant" });
+        await waitForVisibleMedia();
+      }
+      if (!cancelled && containers.some((element) => !ready(element)) && Date.now() < deadline) {
+        await new Promise((resolve) => {
+          const finish = () => { observer.disconnect(); clearTimeout(timer); cancellation.signal.removeEventListener("abort", finish); resolve(); };
+          const observer = new MutationObserver(() => { if (containers.every(ready) || cancelled) finish(); });
+          const timer = setTimeout(finish, Math.max(0, deadline - Date.now()));
+          observer.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ["src", "href"] });
+          cancellation.signal.addEventListener("abort", finish, { once: true });
+          if (cancelled || containers.every(ready)) finish();
+        });
+      }
+    } finally {
+      for (const { element, top, left } of positions) element.scrollTo?.({ top, left, behavior: "instant" });
+      window.scrollTo({ left: position.x, top: position.y, behavior: "instant" });
+    }
+    return containers.filter((element) => !ready(element)).length;
+  }
+
+  async function attachViewportFallbacks(candidates) {
+    if (!wholePage || !sessionId || !globalThis.chrome?.runtime?.sendMessage) return;
+    const positions = [];
+    for (const [candidateIndex, candidate] of candidates.entries()) {
+      for (const [mediaIndex, media] of candidate.media.entries()) {
+        if (media.kind === "image" && media.fallbackRect && !media.dataUrl) {
+          positions.push({ candidateIndex, mediaIndex, selection: media.fallbackRect });
+        }
+      }
+    }
+    if (!positions.length) return;
+    const boundedPositions = positions.slice(0, maxCandidates);
+    try {
+      const response = await globalThis.chrome.runtime.sendMessage({
+        type: "PAGE_CAPTURE_VIEWPORT_FALLBACKS",
+        sessionId,
+        selections: boundedPositions.map((item) => item.selection)
+      });
+      if (!response?.ok || response.dataUrls?.length !== boundedPositions.length) return;
+      response.dataUrls.forEach((dataUrl, index) => {
+        if (!dataUrl) return;
+        const position = boundedPositions[index];
+        candidates[position.candidateIndex].media[position.mediaIndex].dataUrl = dataUrl;
+        candidates[position.candidateIndex].media[position.mediaIndex].previewDataUrl = dataUrl;
+      });
+    } catch {
+    }
+  }
+
+  async function waitForVisibleMedia() {
+    const visibleImages = [...(document.images || [])].filter((image) => {
+      const rect = image.getBoundingClientRect();
+      const viewportHeight = Number(window.innerHeight) || 720;
+      return rect.width >= 48 && rect.height >= 48 && rect.bottom >= 0 && rect.top <= viewportHeight;
+    });
+    await Promise.race([
+      Promise.allSettled(visibleImages.map((image) => typeof image.decode === "function" ? image.decode() : Promise.resolve())),
+      new Promise((resolve) => setTimeout(resolve, 1200))
+    ]);
+    const frame = typeof globalThis.requestAnimationFrame === "function"
+      ? globalThis.requestAnimationFrame.bind(globalThis)
+      : (callback) => setTimeout(callback, 16);
+    await Promise.race([
+      new Promise((resolve) => frame(() => frame(resolve))),
+      new Promise((resolve) => setTimeout(resolve, 1200))
+    ]);
+  }
+
+  function detectAdapter(host) {
+    const adapters = Array.isArray(options.adapters) ? options.adapters : [];
+    const direct = adapters.find((item) => item.hosts.some((suffix) => host === suffix || host.endsWith(`.${suffix}`)));
+    if (direct) {
+      // Detail-page selectors must not constrain feeds, selected content, or
+      // another page shape on the same host.
+      const prefixes = direct.fields?.contentPathPrefixes;
+      if (prefixes?.length && !prefixes.some(prefix => location.pathname.startsWith(prefix))) {
+        const { content, contentParts, contentRequiredPathPrefixes, ...fields } = direct.fields;
+        return { ...direct, fields };
+      }
+      return direct;
+    }
+    const signals = collectPlatformSignals();
+    const platformAdapters = Array.isArray(options.platformAdapters) ? options.platformAdapters : [];
+    return platformAdapters.find((item) => Object.entries(item.signalPatterns || {}).some(([key, patterns]) => {
+      const values = Array.isArray(signals[key]) ? signals[key] : [signals[key]];
+      return patterns.some((pattern) => values.some((value) => {
+        try { return new RegExp(pattern, "iu").test(value); } catch { return false; }
+      }));
+    })) || { id: "generic", hosts: [], cardSelectors: ["main article", "[role=main] article"], fields: {} };
+  }
+
+  function collectPlatformSignals() {
+    const meta = (name) => cleanText(document.querySelector(`meta[name="${name}"]`)?.content);
+    return {
+      generator: meta("generator"),
+      applicationName: meta("application-name") || meta("applicationName"),
+      scripts: [...document.querySelectorAll("script[src]")].map((element) => safeHttpUrl(element.src)).filter(Boolean),
+      links: [...document.querySelectorAll("link[href]")].map((element) => safeHttpUrl(element.href)).filter(Boolean)
+    };
+  }
+
+  function collectMetadata() {
+    const value = (property, name = "property") => cleanText(document.querySelector(`meta[${name}="${property}"]`)?.content);
+    return {
+      title: value("og:title") || value("twitter:title", "name") || cleanText(document.title),
+      description: value("og:description") || value("description", "name") || value("twitter:description", "name"),
+      image: safeHttpUrl(value("og:image") || value("twitter:image", "name")),
+      type: value("og:type"),
+      siteName: value("og:site_name"),
+      author: value("author", "name") || value("article:author"),
+      publishedAt: value("article:published_time")
+    };
+  }
+
+  function collectStructuredData() {
+    const values = [];
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const parsed = JSON.parse(script.textContent || "null");
+        values.push(...(Array.isArray(parsed) ? parsed : parsed?.["@graph"] || [parsed]));
+      } catch {
+      }
+    }
+    return values.filter((item) => item && typeof item === "object");
+  }
+
+  function readArticle() {
+    try {
+      if (typeof globalThis.Readability !== "function") return null;
+      return new globalThis.Readability(document.cloneNode(true), { keepClasses: false }).parse();
+    } catch {
+      return null;
+    }
+  }
+
+  function collectPageSelection() {
+    try {
+      const selection = window.getSelection?.();
+      const text = cleanBlockText(selection?.toString?.());
+      if (!selection || selection.isCollapsed || !selection.rangeCount || !text) return null;
+      const container = document.createElement("div");
+      for (let index = 0; index < selection.rangeCount; index += 1) {
+        container.appendChild(selection.getRangeAt(index).cloneContents());
+      }
+      const html = String(container.innerHTML || "");
+      return {
+        text,
+        html,
+        textBlocks: collectTextBlocks(container, html, text)
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function detectPageType({ adapter, metadata, structured, article, cardCount }) {
+    const types = structured.flatMap((item) => Array.isArray(item["@type"]) ? item["@type"] : [item["@type"]]).filter(Boolean);
+    if (adapter.pageType === "post") return "post";
+    if (types.some((type) => ["Article", "NewsArticle", "BlogPosting"].includes(type))) return "article";
+    if (types.includes("VideoObject") || ["youtube", "bilibili"].includes(adapter.id)) return "video";
+    if (types.some((type) => ["Article", "NewsArticle", "BlogPosting"].includes(type)) || (article?.length || 0) > 500) return "article";
+    if (cardCount > 1) return metadata.type === "website" ? "gallery" : "feed";
+    return ["article", "artwork", "video"].includes(adapter.pageType) ? adapter.pageType : "generic";
+  }
+
+  function reconcileArticlePlacement(articleDocument, mediaValue, contentTargets) {
+    const blocks = Array.isArray(articleDocument?.blocks) ? articleDocument.blocks : [];
+    const media = Array.isArray(mediaValue) ? mediaValue : [];
+    const mediaById = new Map(media.map((item) => [item.id, item]));
+    const blocksById = new Map(blocks.map((block) => [block.id, block]));
+    const blocksByAssetId = new Map(blocks.flatMap((block) => block.assetId ? [[block.assetId, block]] : []));
+    const inlineIds = new Set(blocks.flatMap((block) => block.assetId && mediaById.has(block.assetId) ? [block.assetId] : []));
+    const tableCellIds = new Set(blocks.flatMap(block => (block.rows || []).flatMap(row => row.flatMap(cell => cell.blockIds))));
+    const emittedBlockIds = new Set();
+    const emittedAssetIds = new Set();
+    const orderedBlocks = [];
+    const emit = (block) => {
+      if (!block || emittedBlockIds.has(block.id) || block.assetId && emittedAssetIds.has(block.assetId) && !tableCellIds.has(block.id)) return;
+      emittedBlockIds.add(block.id);
+      if (block.assetId) emittedAssetIds.add(block.assetId);
+      orderedBlocks.push(block);
+    };
+    for (const target of (Array.isArray(contentTargets) ? contentTargets : [])
+      .filter((item) => item?.kind !== "group")
+      .sort((left, right) => Number(left.sourceOrder || 0) - Number(right.sourceOrder || 0))) {
+      for (const blockId of target.articleBlockIds || []) emit(blocksById.get(blockId));
+      for (const mediaId of target.mediaIds || []) {
+        const item = mediaById.get(mediaId);
+        if (!item) continue;
+        inlineIds.add(mediaId);
+        emit(blocksByAssetId.get(mediaId) || {
+          id: `article:${item.kind}:${item.id}`,
+          kind: item.kind,
+          assetId: item.id,
+          sourceUrl: item.url,
+          ...(item.posterUrl ? { posterUrl: item.posterUrl } : {}),
+          label: item.alt || item.filename || ""
+        });
+      }
+    }
+    for (const block of blocks) {
+      if (block.assetId && !inlineIds.has(block.assetId)) continue;
+      emit(block);
+    }
+    return {
+      articleDocument: { version: 1, blocks: orderedBlocks.map((block, sourceOrder) => ({ ...block, sourceOrder })) },
+      media: media.map((item) => ({ ...item, placement: inlineIds.has(item.id) ? "inline" : "unplaced" }))
+    };
+  }
+
+  function ownPostLinks(root) {
+    const links = [...root.querySelectorAll('a[href*="/status/"]')].filter(link => !xQuoteContainer(link));
+    const dated = links.filter(link => link.querySelector("time"));
+    return dated.length ? dated : links.filter(link => {
+      const url = safeHttpUrl(link.href);
+      return url && /^\/[^/]+\/status\/\d+\/?$/u.test(new URL(url).pathname)
+        && cleanText(link.textContent) && !link.querySelector('svg,img') && !link.hasAttribute('aria-label');
+    });
+  }
+
+  function xPostIdentity(value) {
+    try {
+      const url = new URL(value);
+      return /(^|\.)(x|twitter)\.com$/u.test(url.hostname)
+        ? /^\/(?:[^/]+\/status|i\/web\/status)\/(\d+)(?:\/|$)/u.exec(url.pathname)?.[1] || "" : "";
+    } catch { return ""; }
+  }
+
+  function xThreadRoot() {
+    // Conversation IDs may identify individual cells, not the whole timeline.
+    return document.querySelector('[data-testid="primaryColumn"]') || document.querySelector('main') || document.body;
+  }
+
+  function findXPost(postId) {
+    return [...xThreadRoot().querySelectorAll('article')].find(post => ownPostLinks(post).some(link => xPostIdentity(link.href) === postId));
+  }
+
+  function waitForXPost(postId, deadline) {
+    const sourceId = xPostIdentity(location.href);
+    return new Promise((resolve, reject) => {
+      const finish = (post, error) => { clearTimeout(timer); observer.disconnect(); cancellation.signal.removeEventListener('abort', abort); error ? reject(error) : resolve(post); };
+      const abort = () => finish(null, new Error('网页扫描已取消；当前草稿已保留'));
+      const check = () => {
+        if (xPostIdentity(location.href) !== sourceId) return finish(null, new Error('采集页面已改变，请重新扫描；当前草稿已保留'));
+        const post = findXPost(postId);
+        if (post) finish(post);
+      };
+      const observer = new MutationObserver(check);
+      const timer = setTimeout(() => finish(null, Object.assign(new Error('未能找到选中的 X 帖子，请检查页面加载后重新扫描；当前草稿已保留'), { code: 'X_POST_NOT_MOUNTED' })), Math.max(1, deadline - Date.now()));
+      observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      cancellation.signal.addEventListener('abort', abort, { once: true });
+      if (cancelled) abort(); else check();
+    });
+  }
+
+  function xPostCanonicalUrl(value) {
+    if (!xPostIdentity(value)) return "";
+    const url = new URL(value);
+    url.pathname = url.pathname.match(/^\/(?:[^/]+\/status|i\/web\/status)\/\d+/u)[0];
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  }
+
+  function xPostTextNodes(root) {
+    const classic = [...root.querySelectorAll('[data-testid="tweetText"]')];
+    // The public X post layout uses a directional, pre-wrapped text container.
+    return classic.length ? classic : [...root.querySelectorAll('div[dir="auto"].whitespace-pre-wrap')];
+  }
+
+  function xExpandButtons(root) {
+    return [...root.querySelectorAll('[data-testid="tweet-text-show-more-link"],button')].filter(button =>
+      !xQuoteContainer(button) && (button.dataset.testid === "tweet-text-show-more-link"
+        || xPostTextNodes(root).some(node => node.contains(button)) && /^(?:Show more|显示更多|顯示更多)$/iu.test(button.textContent.trim())));
+  }
+
+  function isXContentMutation(record) {
+    // Player clocks and reaction counters keep changing even when the post
+    // content is ready. Only text, post nodes and media affect capture.
+    const text = '[data-testid="tweetText"],div[dir="auto"].whitespace-pre-wrap';
+    const content = `article,${text},video,[data-testid="tweetPhoto"],a[href*="/photo/"] img,[role="progressbar"],[aria-busy]`;
+    if (record.type === 'attributes') return true;
+    const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+    if (target?.closest(text)) return true;
+    return [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1
+      && (node.matches(content) || node.querySelector(content)));
+  }
+
+  async function collectXAuthorThread(current, adapter, thread, canonicalUrl, deadline) {
+    const author = collectAdapterFields(current, adapter).handle.toLocaleLowerCase("en-US");
+    if (!author) return [];
+    const postId = xPostIdentity(canonicalUrl);
+    const parts = new Map();
+    let ended = false;
+    let lastOwn = current;
+    let scrollRoot = null;
+    for (let node = current.parentElement; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+      if (node.scrollHeight > node.clientHeight && /auto|scroll/u.test(getComputedStyle(node).overflowY)) { scrollRoot = node; break; }
+    }
+    const scroller = scrollRoot || window;
+    const start = { top: scrollRoot ? scrollRoot.scrollTop : window.scrollY, left: scrollRoot ? scrollRoot.scrollLeft : window.scrollX };
+    const collect = () => {
+      for (const post of thread.querySelectorAll('article')) {
+        const fields = collectAdapterFields(post, adapter);
+        const id = xPostIdentity(fields.canonicalUrl);
+        // Ancestors on a reply page are not supplements. IDs retain ordering
+        // when X recycles the earlier DOM nodes during scrolling.
+        if (!id || BigInt(id) < BigInt(postId)) continue;
+        if (id === postId) { lastOwn = post; continue; }
+        if (fields.handle.toLocaleLowerCase("en-US") !== author) { ended = true; break; }
+        lastOwn = post;
+        const content = xPostContent(post);
+        if (content && (content.text || content.media.length)) parts.set(id, xSupplementContent(content, fields.canonicalUrl));
+      }
+    };
+    let stableRounds = 0;
+    try {
+      collect();
+      while (!ended && !cancelled && Date.now() < deadline && stableRounds < 3) {
+        if (xPostIdentity(location.href) !== postId) throw new Error("采集页面已改变，请重新扫描；当前草稿已保留");
+        const position = scrollRoot ? scrollRoot.scrollTop : window.scrollY;
+        const viewport = Math.max(1, scrollRoot ? scrollRoot.clientHeight : window.innerHeight);
+        const height = scrollRoot ? scrollRoot.scrollHeight : Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+        const count = parts.size;
+        const tail = lastOwn?.isConnected ? lastOwn.getBoundingClientRect().bottom - (scrollRoot?.getBoundingClientRect().top || 0) : 0;
+        // Visit the end of the already captured author segment rather than
+        // scrolling through every screen of a long prompt or decoding photos.
+        const nextTop = Math.min(Math.max(0, height - viewport), position + Math.max(Math.round(viewport * 0.85), tail - Math.round(viewport * 0.15)));
+        scroller.scrollTo({ top: nextTop, behavior: "instant" });
+        await waitForScrollRender(thread, isXContentMutation, Math.max(1, deadline - Date.now()));
+        collect();
+        const nextHeight = scrollRoot ? scrollRoot.scrollHeight : Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+        const nextPosition = scrollRoot ? scrollRoot.scrollTop : window.scrollY;
+        stableRounds = count === parts.size && position === nextPosition && nextPosition + viewport >= nextHeight ? stableRounds + 1 : 0;
+      }
+      if (cancelled || !ended && stableRounds < 3) scanIncomplete = true;
+      return [...parts.values()];
+    } finally {
+      scroller.scrollTo({ ...start, behavior: "instant" });
+    }
+  }
+
+  async function readXSupplement(sourceUrl) {
+    const postId = xPostIdentity(sourceUrl);
+    const sourceId = xPostIdentity(location.href);
+    if (!postId || !sourceId || (options.xSourceUrl && location.href !== options.xSourceUrl)
+      || (!options.xSupplementInThread && sourceId !== postId)) throw new Error("评论页面已改变，请重新选择评论；当前草稿已保留");
+    const deadline = Date.now() + positiveInteger(options.mediaTimeoutMs, 1200);
+    let sourceScroll = null;
+    try {
+      if (options.xSupplementInThread) {
+        let scrollRoot = null;
+        for (let node = findXPost(sourceId)?.parentElement || xThreadRoot(); node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+          if (node.scrollHeight > node.clientHeight && /auto|scroll/u.test(getComputedStyle(node).overflowY)) { scrollRoot = node; break; }
+        }
+        sourceScroll = { target: scrollRoot || window, top: scrollRoot ? scrollRoot.scrollTop : window.scrollY, left: scrollRoot ? scrollRoot.scrollLeft : window.scrollX };
+        if (!findXPost(postId)) {
+          sourceScroll.target.scrollTo({ top: 0, behavior: 'instant' });
+          let stableRounds = 0;
+          while (!findXPost(postId) && !cancelled && Date.now() < deadline && stableRounds < 3) {
+            if (xPostIdentity(location.href) !== sourceId) throw new Error('评论页面已改变，请重新选择评论；当前草稿已保留');
+            await waitForScrollRender(xThreadRoot(), isXContentMutation, Math.max(1, deadline - Date.now()));
+            if (findXPost(postId)) break;
+            const position = scrollRoot ? scrollRoot.scrollTop : window.scrollY;
+            const viewport = Math.max(1, scrollRoot ? scrollRoot.clientHeight : innerHeight);
+            const height = scrollRoot ? scrollRoot.scrollHeight : Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+            sourceScroll.target.scrollTo({ top: Math.min(Math.max(0, height - viewport), position + Math.round(viewport * 0.85)), behavior: 'instant' });
+            stableRounds = position === (scrollRoot ? scrollRoot.scrollTop : window.scrollY) ? stableRounds + 1 : 0;
+          }
+          if (!findXPost(postId)) await waitForXPost(postId, deadline);
+        }
+      }
+      // Text and its player can arrive in separate React commits.
+      const selectedPost = findXPost(postId) || await waitForXPost(postId, deadline);
+      await waitForScrollRender(selectedPost, isXContentMutation, Math.max(1, deadline - Date.now()));
+      return await new Promise((resolve, reject) => {
+        const clicked = new WeakSet();
+        let settling = false;
+        let finished = false;
+        const finish = (value, error) => { if (finished) return; finished = true; observer.disconnect(); clearTimeout(timer); cancellation.signal.removeEventListener("abort", abort); error ? reject(error) : resolve(value); };
+        const abort = () => finish(null, new Error("评论读取已取消；当前草稿已保留"));
+        const check = () => {
+          if (finished) return;
+          if (xPostIdentity(location.href) !== sourceId) return finish(null, new Error("评论页面已改变，请重新选择评论；当前草稿已保留"));
+          const root = findXPost(postId);
+          if (!root) return;
+          const buttons = xExpandButtons(root);
+          if (buttons.length) {
+            for (const button of buttons) if (!clicked.has(button)) { clicked.add(button); button.click(); }
+            return;
+          }
+          if (!settling) {
+            settling = true;
+            void waitForScrollRender(root, isXContentMutation, Math.max(1, deadline - Date.now())).then(() => {
+              if (finished) return;
+              if (!root.isConnected) { settling = false; check(); return; }
+              const content = xPostContent(root, { includeQuotes: false });
+              if (content && !content.partial && (content.text || content.media.length)) finish(xSupplementContent(content, sourceUrl));
+              else { settling = false; check(); }
+            });
+          }
+        };
+        const observer = new MutationObserver(check);
+        const timer = setTimeout(() => finish(null, Object.assign(new Error("未能取得评论全文，请检查登录、网络或原评论是否仍可展开；当前草稿已保留"), { code: 'X_POST_TEXT_INCOMPLETE' })), Math.max(1, deadline - Date.now()));
+        observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+        cancellation.signal.addEventListener("abort", abort, { once: true });
+        if (cancelled) abort(); else check();
+      });
+    } finally {
+      if (sourceScroll) sourceScroll.target.scrollTo({ top: sourceScroll.top, left: sourceScroll.left, behavior: 'instant' });
+    }
+  }
+
+  function xSupplementContent(content, sourceUrl) {
+    const id = "supplement:" + hashText(sourceUrl);
+    return { id, text: content.text, sourceUrl, partial: content.partial,
+      media: content.media.filter(item => !item.isQuoted).map(item => ({ ...item, id: `${id}:${item.id}`,
+        originalWorkUrl: sourceUrl, quotedPostUrl: "" })) };
+  }
+
+  function copyPostInline(source, target) {
+    for (const child of source.childNodes) {
+      if (child.nodeType === 3) target.append(child.cloneNode());
+      else if (child.nodeType === 1) {
+        const tag = child.tagName.toLowerCase();
+        if (["button", "script", "style"].includes(tag)) continue;
+        if (tag === "img") {
+          if (child.alt) target.append(document.createTextNode(child.alt));
+        } else if (tag === "br") target.append(document.createElement("br"));
+        else {
+          const inline = document.createElement(["a", "strong", "em", "b", "i", "code"].includes(tag) ? tag : "span");
+          if (tag === "a" && safeHttpUrl(child.href)) inline.setAttribute("href", child.href);
+          if (["div", "p"].includes(tag)) target.append(document.createTextNode("\n"));
+          copyPostInline(child, inline);
+          target.append(inline);
+          if (["div", "p"].includes(tag)) target.append(document.createTextNode("\n"));
+        }
+      }
+    }
+  }
+
+  function xPostContent(root, { textOnly = false, includeQuotes = true } = {}) {
+    const texts = xPostTextNodes(root);
+    if (!texts.length && !root.querySelector('video, [data-testid=tweetPhoto],a[href*="/photo/"] img')) return null;
+    const fragment = document.createElement("div");
+    const content = [];
+    for (const node of texts) {
+      const quote = xQuoteContainer(node);
+      if (quote && !includeQuotes) continue;
+      const p = document.createElement(quote ? "blockquote" : "p");
+      // Keep inline links and paragraph breaks, without nesting tweet divs inside paragraphs.
+      copyPostInline(node, p);
+      const value = readBlockText(p);
+      if (!value) continue;
+      fragment.append(p);
+      content.push({ id: "text:x:" + hashText(value), text: value, html: p.outerHTML,
+        kind: quote ? "quote" : "paragraph", relevance: "explicit-creative", sourceOrder: content.length });
+    }
+    const media = textOnly ? [] : collectMedia(root, maxMedia).filter(item => item.kind !== "image" ||
+      !/profile_images|profile_banners/u.test(item.url));
+    return { text: content.map(b => b.text).join("\n\n"), html: fragment.innerHTML, textBlocks: content, media,
+      partial: xExpandButtons(root).length > 0 };
+  }
+
+  function candidateForRoot(root, index, context) {
+    const isPageRoot = root === document.body || root === context.pageRoot;
+    let textRoot = root;
+    if (!isPageRoot && context.adapter.id === "pinterest") {
+      // Hover controls are not artwork descriptions. Their transient presence
+      // must not change the structure used to select other cards in a board.
+      textRoot = root.cloneNode(true);
+      for (const control of textRoot.querySelectorAll('button,input,select,textarea,[role="button"],[role="combobox"],[hidden],[aria-hidden="true"]')) control.remove();
+    }
+    const siteData = isPageRoot ? context.siteData : null;
+    const adapterFields = collectAdapterFields(root, context.adapter);
+    const capturePost = context.adapter.id === "x" && !context.pageSelection && !options.editedRegion?.token;
+    const post = capturePost ? xPostContent(root) : null;
+    if (capturePost && !post) return null;
+    const cardLink = isPageRoot || context.pageType === "article"
+      || context.pageType === "post" && root.contains?.(document.querySelector("h1")) ? "" : context.templateCard
+      ? genericDetailReferences(root)[0]?.url || safeHttpUrl(context.templateCard.querySelector('a[href]')?.href)
+        || genericDetailReferences(context.templateCard.querySelector('img,video') || context.templateCard)[0]?.url || ''
+      : safeHttpUrl(root.querySelector("a[href]")?.href);
+    const canonicalUrl = adapterFields.canonicalUrl || cardLink || safeHttpUrl(siteData?.canonicalUrl) || context.canonicalUrl;
+    const structured = context.structured.find((item) => sameUrl(item.url || item.mainEntityOfPage, canonicalUrl)) || (isPageRoot ? context.structured[0] : null) || {};
+    let title = cleanText(isPageRoot
+      ? options.feishuDocument?.title || siteData?.title || (genericCapture ? root.querySelector("h1")?.textContent || context.metadata.title : "") || (context.contentRoot ? adapterFields.title : "") || context.article?.title || structured.headline || structured.name || (context.pageType === "post" ? "" : context.metadata.title)
+      : adapterFields.title || root.querySelector("h1,h2,h3,[role=heading]")?.textContent || structured.headline || structured.name || (context.pageType === "post" ? "" : root.querySelector("img[alt]")?.alt));
+    if (!title && context.templateCard) title = cleanText(context.templateCard.querySelector('h1,h2,h3,[role=heading]')?.textContent || root.getAttribute('alt'));
+    const pageSelection = isPageRoot ? context.pageSelection : null;
+    const articleText = context.pageType === "article" ? context.article?.textContent : "";
+    // One work can place its gallery and prompt in sibling regions, outside ordinary article markup.
+    const partSelectors = context.contentRoot ? context.adapter.fields?.contentParts || [] : [];
+    const contentParts = partSelectors.length ? [...root.querySelectorAll(partSelectors.join(","))] : [];
+    const captureRoots = contentParts.length ? contentParts : [root];
+    const text = post ? post.text : cleanBlockText(context.contentRoot ? (options.feishuDocument?.text || (contentParts.length ? contentParts.map(readBlockText).filter(Boolean).join("\n\n") : root.innerText || root.textContent)) : isPageRoot
+      ? pageSelection?.text || articleText || siteData?.contentText || context.article?.textContent || structured.articleBody || root.innerText || context.metadata.description
+      : textRoot.innerText || textRoot.textContent);
+    const contentHtml = post ? post.html : context.contentRoot ? contentRootHtml(root, contentParts) : isPageRoot
+      ? pageSelection?.html || context.article?.content || ""
+      : "";
+    const structuredTextBlocks = !context.contentRoot && !articleText && siteData?.contentText
+      ? [{
+          id: "text:structured:" + hashText(siteData.contentText),
+          text: cleanBlockText(siteData.contentText),
+          html: "",
+          kind: "paragraph",
+          relevance: "explicit-creative",
+          sourceOrder: 0
+        }]
+      : null;
+    const textBlocks = post?.textBlocks || pageSelection?.textBlocks || structuredTextBlocks || collectTextBlocks(textRoot, contentHtml, text);
+    const siteMedia = [...(options.feishuDocument?.media || []), ...(Array.isArray(siteData?.media) ? siteData.media : [])];
+    // A site record can pair a playback URL with the same asset's original file.
+    // Keep that richer record instead of adding its JSON-LD playback copy again.
+    // Posters cannot prove identity: separate videos may share one cover image.
+    const siteMediaUrls = new Set(siteMedia.flatMap(item => [item.url, ...(item.variants || []).map(variant => variant.url)]
+      .filter(Boolean).map(url => `${item.kind}:${url}`)));
+    siteMedia.push(...collectStructuredMedia(structured).filter(item =>
+      ![item.url, ...(item.variants || []).map(variant => variant.url)].some(url => siteMediaUrls.has(`${item.kind}:${url}`))));
+    const domMedia = context.selectedMedia ?? post?.media ?? (pageSelection || (root.isConnected === false && !options.manualContentHtml) ? [] : captureRoots.flatMap(part => collectMedia(part, context.maxMedia)));
+    // Artwork schemas can expose a cropped listing cover separately from the
+    // actual project gallery. Keep richer matching variants and all videos.
+    const scopedSiteMedia = context.contentRoot && context.adapter.fields?.omitCoverWhenContentImages && domMedia.some(item => item.kind === "image")
+      ? siteMedia.filter(item => item.kind !== "image" || domMedia.some(candidate => mediaValuesOverlap(item, candidate)))
+      : siteMedia;
+    const pairedDomIds = new Set();
+    const pairedSiteMedia = scopedSiteMedia.map((item) => {
+      const visible = domMedia.find((candidate) => mediaValuesOverlap(item, candidate));
+      if (visible) pairedDomIds.add(visible.id);
+      return visible ? {
+        ...item,
+        width: item.width || visible.width,
+        height: item.height || visible.height,
+        posterUrl: item.posterUrl || visible.posterUrl,
+        variants: [...(item.variants || []), ...(visible.variants || [])],
+        fallbackRect: visible.fallbackRect,
+        dataUrl: visible.dataUrl,
+        previewDataUrl: visible.previewDataUrl
+      } : item;
+    });
+    let media = mergeCollectedMedia([
+      ...pairedSiteMedia,
+      ...domMedia.filter((item) => !pairedDomIds.has(item.id))
+    ], context.maxMedia);
+    const article = collectArticleDocument(textRoot, contentHtml, textBlocks, media, context.maxMedia);
+    if (capturePost) {
+      for (const item of media.filter(item => item.postMediaUrl)) {
+        item.quotedPostUrl = sameUrl(item.postMediaUrl, canonicalUrl) ? "" : item.postMediaUrl;
+        item.originalWorkUrl = item.postMediaUrl;
+        if (!article.blocks.some(block => block.assetId === item.id)) article.blocks.push({
+          id: `article:media:${item.id}`, kind: item.kind, assetId: item.id, sourceUrl: item.url,
+          sourceOrder: article.blocks.length
+        });
+      }
+    }
+    media = mergeCollectedMedia([...media, ...article.media], context.maxMedia);
+    if (!title && !text && !media.length) return null;
+    const pageType = isPageRoot || context.pageType === "article" ? context.pageType : ["post", "video"].includes(context.adapter.pageType) ? context.adapter.pageType : "artwork";
+    const author = cleanText(siteData?.sourceFacts?.author || adapterFields.author || structuredAuthorName(structured.author) || (isPageRoot ? context.metadata.author : "") || root.querySelector('[rel=author],[data-testid*=author],[class*=author]')?.textContent);
+    if (!title && pageType === "post") {
+      const identity = author || (adapterFields.handle ? `@${adapterFields.handle}` : "");
+      title = [identity, cleanText(text).slice(0, 96)].filter(Boolean).join(" · ") || context.metadata.siteName || location.hostname;
+    }
+    const itemId = cleanText(siteData?.sourceFacts?.itemId || structured.identifier?.value || structured.identifier) || itemIdFromUrl(canonicalUrl);
+    const captureScope = pageSelection ? "selection" : "document";
+    const extractionMethod = pageSelection
+      ? "selection"
+      : siteData?.sourceFacts?.extractionMethod === "structured" ? "structured"
+        : context.article?.content ? "readability" : structured.articleBody ? "structured" : "page";
+    // Feishu virtualizes document blocks; a DOM snapshot cannot certify the whole document.
+    const documentPartial = scanIncomplete || (context.adapter.id === "feishu" && !pageSelection && !options.feishuDocument?.complete);
+    const complete = !documentPartial && !post?.partial && (siteData?.completeness === "complete" || Boolean(title && (text || media.length)));
+    const region = markCaptureRegion(root, index, text, media.length);
+    if (region && options.feishuDocument) {
+      region.marker = options.feishuDocument.marker;
+      region.id = options.feishuDocument.marker;
+      region.contentTargets = options.feishuDocument.targets;
+    }
+    if (region && root.isConnected !== false) {
+      region.contentTargets = collectContentTargets(
+        root,
+        article.blocks,
+        media
+      );
+    }
+    // Generic HTML already carries document order. Matching text in navigation
+    // or repeated captions must not relocate its headings or collapse references.
+    const placed = genericCapture ? {
+      articleDocument: { version: 1, blocks: article.blocks },
+      media: media.map(item => ({ ...item, placement: article.blocks.some(block => block.assetId === item.id) ? "inline" : "unplaced" }))
+    } : reconcileArticlePlacement({ version: 1, blocks: article.blocks }, media, region?.contentTargets || []);
+    media = placed.media;
+    return {
+      id: `${context.adapter.id}:${itemId || index}:${hashText(`${canonicalUrl}\n${title}`)}`,
+      pageType,
+      title,
+      canonicalUrl,
+      contentHtml,
+      contentText: genericCapture ? textBlocks.map(block => block.text).join("\n\n") : text,
+      textBlocks: genericCapture ? textBlocks.map(block => ({ ...block, kind: "section" })) : textBlocks,
+      articleDocument: placed.articleDocument,
+      region,
+      excerpt: cleanText(context.article?.excerpt || (isPageRoot ? context.metadata.description : "")),
+      media,
+      sourceFacts: {
+        authorUrl: siteData?.sourceFacts?.authorUrl || "",
+        originalSourceUrl: siteData?.sourceFacts?.originalSourceUrl || "",
+        imageDescription: siteData?.sourceFacts?.imageDescription || "",
+        ...(typeof siteData?.sourceFacts?.originalPromptAvailable === "boolean" ? { originalPromptAvailable: siteData.sourceFacts.originalPromptAvailable } : {}),
+        ...(siteData?.sourceFacts?.description ? { description: cleanBlockText(siteData.sourceFacts.description) } : {}),
+        provider: cleanText(siteData?.sourceFacts?.provider) || (context.adapter.id === "generic" ? location.hostname : context.adapter.id),
+        pageType,
+        itemId,
+        author,
+        handle: cleanText(siteData?.sourceFacts?.handle || adapterFields.handle) || (author.startsWith("@") ? author.slice(1) : ""),
+        publishedAt: siteData?.sourceFacts?.publishedAt || adapterFields.publishedAt || structured.datePublished || (isPageRoot ? context.metadata.publishedAt : "") || "",
+        capturedAt,
+        model: cleanText(siteData?.sourceFacts?.model || adapterFields.model || structured.model || root.querySelector('[class*=model],[data-testid*=model]')?.textContent),
+        dimensions: cleanText(siteData?.sourceFacts?.dimensions || (structured.width && structured.height ? `${structured.width}×${structured.height}` : "")),
+        duration: cleanText(structured.duration),
+        license: cleanText(structured.license),
+        engagement: { ...structuredEngagement(structured.interactionStatistic), ...adapterFields.engagement, ...(siteData?.sourceFacts?.engagement || {}) },
+        captureScope,
+        extractionMethod,
+        status: complete ? "complete" : "partial"
+      },
+      completeness: complete ? "complete" : "partial",
+      extraction: {
+        textTruncated: documentPartial || post?.partial === true,
+        scope: captureScope,
+        method: extractionMethod,
+        textBlockCount: textBlocks.length
+      },
+      adapter: context.adapter.id
+    };
+  }
+
+  // The injected snapshot must carry its own helpers across the extension/page boundary.
+  function mediaValuesOverlap(left, right) {
+    if (left.kind !== right.kind) return false;
+    const urls = new Set([left.url, ...(left.variants || []).map((item) => item.url)].filter(Boolean));
+    return [right.url, ...(right.variants || []).map((item) => item.url)]
+      .some((url) => url && urls.has(url));
+  }
+
+  function buildEditedRegionRoot(baseRoot, token) {
+    const attributeValue = String(token).replace(/["\\]/gu, "");
+    const includeSelector = `[data-promptdirector-page-edit-include="${attributeValue}"]`;
+    const excludeSelector = `[data-promptdirector-page-edit-exclude="${attributeValue}"]`;
+    const includes = [...document.querySelectorAll?.(includeSelector) || []]
+      .filter((element) => element !== baseRoot && !baseRoot.contains?.(element));
+    const roots = [baseRoot, ...includes].sort((left, right) => {
+      const position = left.compareDocumentPosition?.(right) || 0;
+      return position & 2 ? 1 : -1;
+    });
+    const wrapper = document.createElement("div");
+    for (const root of roots) {
+      if (root.matches?.(excludeSelector)) continue;
+      const clone = root.cloneNode(true);
+      clone.querySelectorAll?.(excludeSelector).forEach((element) => element.remove());
+      clone.removeAttribute?.("data-promptdirector-page-edit-include");
+      clone.removeAttribute?.("data-promptdirector-page-edit-exclude");
+      clone.querySelectorAll?.(`${includeSelector},${excludeSelector}`).forEach((element) => {
+        element.removeAttribute("data-promptdirector-page-edit-include");
+        element.removeAttribute("data-promptdirector-page-edit-exclude");
+      });
+      wrapper.append(clone);
+    }
+    for (const element of document.querySelectorAll?.(`${includeSelector},${excludeSelector}`) || []) {
+      element.removeAttribute?.("data-promptdirector-page-edit-include");
+      element.removeAttribute?.("data-promptdirector-page-edit-exclude");
+    }
+    return wrapper;
+  }
+
+  function collectSubjectRegionRoots(limit) {
+    const semantic = [...document.querySelectorAll?.("main,article,[role=main],[itemprop=articleBody]") || []];
+    const bodyChildren = [...(document.body?.children || [])].filter((element) => element.matches?.("section,div"));
+    const candidates = [...new Set([...semantic, ...bodyChildren])]
+      .filter(isContentRoot)
+      .map((root) => ({ root, score: regionRootScore(root) }))
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score);
+    const accepted = [];
+    const signatures = new Set();
+    for (const item of candidates) {
+      const signature = hashText(`${cleanBlockText(item.root.innerText)}\n${[...item.root.querySelectorAll?.("img,video,iframe,canvas") || []].length}`);
+      if (signatures.has(signature)) continue;
+      signatures.add(signature);
+      accepted.push(item.root);
+      if (accepted.length >= limit) break;
+    }
+    return accepted;
+  }
+
+  function createSelectionTemplatePlan() {
+    let selected = selectedTemplateNode;
+    let componentMediaIndex = null;
+    if (selected.matches('img,video') && selected.getRootNode().host) {
+      const media = selected;
+      while (selected.getRootNode().host) selected = selected.getRootNode().host;
+      componentMediaIndex = templateMediaPeers(selected).indexOf(media);
+    }
+    // A deliberate selection supplies the scope: inspect its ancestors rather
+    // than relying on site-specific names such as grid, wall, list or gallery.
+    let card = selected.matches('img,video') ? selected.parentElement : selected;
+    while (card?.parentElement && card !== document.body) {
+      const peers = [...card.parentElement.children].filter(peer => repeatedCardShape(peer) === repeatedCardShape(card) && isContentRoot(peer));
+      if (peers.length > 1) break;
+      card = card.parentElement;
+    }
+    if (card === document.body || !card?.parentElement) card = null;
+    if (!card) throw Object.assign(new Error('所选内容没有可确认的重复案例，请选择列表中的一个案例'), { code: 'CAPTURE_TEMPLATE_NOT_REPEATABLE' });
+    const path = [];
+    for (let node = selected; node !== card; node = node.parentElement) {
+      const media = node.matches('img,video');
+      path.unshift({ tag: media ? 'media' : node.tagName,
+        index: media ? templateMediaPeers(node.parentElement).findIndex(peer => templateMediaSources(peer).some(source => templateMediaSources(node).includes(source)))
+          : [...node.parentElement.children].filter(peer => peer.tagName === node.tagName).indexOf(node) });
+    }
+    if (componentMediaIndex !== null) path.push({ tag: 'media', index: componentMediaIndex });
+    return { parent: card.parentElement, shape: repeatedCardShape(card), path, cards: new WeakMap() };
+  }
+
+  function selectionTemplateRoots(template) {
+    if (!template.parent.isConnected) throw Object.assign(new Error('列表结构已变化，请重新选择案例'), { code: 'CAPTURE_TEMPLATE_EXPIRED' });
+    return [...template.parent.children].filter(card => repeatedCardShape(card) === template.shape).map(card => {
+      let selected = card;
+      for (const step of template.path) selected = selected && (step.tag === 'media' ? templateMediaPeers(selected) : [...selected.children].filter(node => node.tagName === step.tag))[step.index];
+      if (!selected) throw Object.assign(new Error('列表内容与手选范围不一致，请重新选择案例'), { code: 'CAPTURE_TEMPLATE_LAYOUT_CHANGED' });
+      template.cards.set(selected, card);
+      return selected;
+    });
+  }
+
+  function templateMediaSources(node) {
+    return [node, ...node.querySelectorAll('source')].flatMap(item => [item.currentSrc, item.src, item.poster]).filter(Boolean);
+  }
+
+  function templateMediaPeers(parent) {
+    const groups = [];
+    for (const node of parent.shadowRoot ? renderedQueryAll(parent, 'img,video') : [...parent.children].filter(child => child.matches('img,video'))) {
+      const sources = templateMediaSources(node);
+      const existing = groups.findIndex(peer => templateMediaSources(peer).some(source => sources.includes(source)));
+      if (existing < 0) groups.push(node);
+      else if (node.matches('video')) groups[existing] = node;
+    }
+    return groups;
+  }
+
+  function repeatedCardShape(root) {
+    return [root.tagName, root.getAttribute('role') || '', [...root.classList].sort().join('.')].join(':');
+  }
+
+  function collectRepeatedCardRoots(limit) {
+    const parents = [...document.querySelectorAll?.("main,[role=main],section,ul,ol,[class*=grid],[class*=gallery],[class*=feed],[class*=list]") || []];
+    const groups = [];
+    for (const parent of parents) {
+      if (parent.closest?.("nav,aside,header,footer,[role=navigation],[role=complementary],[role=contentinfo]")) continue;
+      const bySignature = new Map();
+      for (const child of [...(parent.children || [])]) {
+        if (!isContentRoot(child)) continue;
+        const textLength = [...cleanText(child.innerText)].length;
+        const mediaCount = [...child.querySelectorAll?.("img,video,iframe,canvas") || []].filter((item) => !isExcludedMedia(item)).length;
+        if (!mediaCount && textLength < 20) continue;
+        const classShape = [...(child.classList || [])]
+          .filter((token) => token.length <= 48 && !/\d{4,}/u.test(token))
+          .sort()
+          .slice(0, 3)
+          .join(".");
+        const signature = [
+          cleanText(child.tagName).toLowerCase(),
+          cleanText(child.getAttribute?.("role")),
+          child.querySelector?.("h1,h2,h3,[role=heading]") ? "heading" : "",
+          mediaCount ? "media" : "",
+          classShape
+        ].join(":");
+        const group = bySignature.get(signature) || [];
+        group.push({ root: child, score: textLength + mediaCount * Math.max(120, textLength),
+          captioned: textLength >= 20 || Boolean(child.querySelector?.("h1,h2,h3,h4,h5,h6,[role=heading]")) });
+        bySignature.set(signature, group);
+      }
+      for (const group of bySignature.values()) {
+        if (group.length < 2) continue;
+        groups.push({
+          items: group,
+          score: group.reduce((total, item) => total + item.score, 0)
+        });
+      }
+    }
+    if (genericCapture) {
+      const captioned = new Map(groups.flatMap(group => group.items.map(item => [item.root, item.captioned])));
+      const roots = [...captioned.keys()];
+      // Innermost repeats are the cases, unless they are only uncaptioned
+      // thumbnails inside a captioned card: that card keeps its text and media together.
+      const inner = new Map(roots.map(root => [root, roots.filter(other => other !== root && root.contains(other))]));
+      const ownsThumbnails = root => captioned.get(root) && inner.get(root).length && inner.get(root).every(other => !captioned.get(other));
+      return roots.filter(root => (ownsThumbnails(root) || !inner.get(root).length)
+        && !roots.some(other => other !== root && other.contains(root) && ownsThumbnails(other)))
+        .sort((a, b) => a.compareDocumentPosition(b) & 4 ? -1 : 1).slice(0, limit);
+    }
+    const best = groups.sort((left, right) => right.score - left.score)[0];
+    return best ? best.items.map((item) => item.root).slice(0, limit) : [];
+  }
+
+  function regionRootScore(root) {
+    const text = cleanBlockText(root.innerText);
+    const textLength = [...text].length;
+    const mediaCount = [...root.querySelectorAll?.("img,video,iframe,canvas") || []].filter((item) => !isExcludedMedia(item)).length;
+    const linkTextLength = [...root.querySelectorAll?.("a[href]") || []]
+      .reduce((total, link) => total + [...cleanText(link.textContent)].length, 0);
+    const controls = [...root.querySelectorAll?.("button,input,select,textarea,[role=button]") || []].length;
+    const semanticBoost = root.matches?.("main,article,[role=main],[itemprop=articleBody]") ? Math.max(200, textLength * 0.35) : 0;
+    const linkPenalty = textLength ? Math.min(textLength, linkTextLength) : 0;
+    return textLength + mediaCount * Math.max(120, Math.min(600, textLength || 120)) + semanticBoost - linkPenalty - controls * 40;
+  }
+
+  function markCaptureRegion(root, index, text, mediaCount) {
+    if (!root?.setAttribute) return null;
+    const marker = `${sessionId || "page"}:${hashText(`${index}\n${cleanBlockText(text).slice(0, 512)}`)}`;
+    root.setAttribute("data-promptdirector-capture-region", marker);
+    return {
+      id: marker,
+      marker,
+      label: `主体方案 ${index + 1}`,
+      score: regionRootScore(root),
+      textLength: [...cleanBlockText(text)].length,
+      mediaCount
+    };
+  }
+
+  function isPageChrome(element) {
+    if (options.manualContentHtml) return false;
+    const semantic = "nav,aside,header,footer,[role=navigation],[role=banner],[role=complementary],[role=contentinfo]";
+    const feishu = location.hostname === "feishu.cn" || location.hostname.endsWith(".feishu.cn");
+    if (!feishu) return Boolean(composedClosest(element, `${semantic},[class*=comment],[class*=recommend],[data-testid*=comment],[data-testid*=recommend]`));
+    for (let node = element; node; node = node.parentElement) {
+      if (node.matches?.(semantic)) return true;
+      // Feishu's comment-capable block wrappers contain document text, not replies.
+      const classes = [...(node.classList || [])].filter(name =>
+        name !== "block-comment" && !name.endsWith("-block-comment") &&
+        name !== "local-comment-all-third-party" && name !== "ai-recommend-content-hidden");
+      if (/comment|recommend/u.test(classes.join(" ")) || /comment|recommend/u.test(node.getAttribute?.("data-testid") || "")) return true;
+      if (node.matches?.(".page-block.root-block")) break;
+    }
+    return false;
+  }
+
+  function collectContentTargets(root, articleBlocks, media) {
+    const semanticSelector = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,code[data-language],table,img,video,iframe,a[href]";
+    const pathFor = (element) => {
+      const parts = [];
+      let current = element;
+      while (current.getRootNode?.().host) current = current.getRootNode().host;
+      while (current?.nodeType === 1) {
+        const tag = cleanText(current.tagName).toLocaleLowerCase("en-US");
+        const siblings = [...(current.parentElement?.children || [])].filter((item) => item.tagName === current.tagName);
+        parts.unshift(`${tag}:nth-of-type(${Math.max(1, siblings.indexOf(current) + 1)})`);
+        if (current === document.body) break;
+        current = current.parentElement;
+      }
+      return parts.join(" > ");
+    };
+    const backgroundUrl = (element) => {
+      try {
+        const match = getComputedStyle(element).backgroundImage.match(/url\(["']?([^"')]+)["']?\)/iu);
+        return safeHttpUrl(match?.[1]);
+      } catch {
+        return "";
+      }
+    };
+    const mediaIdsFor = (element, kind) => {
+      const urls = new Set();
+      if (kind === "image" && element.matches?.("img")) {
+        for (const variant of collectImageVariants(element)) urls.add(variant.url);
+      }
+      if (kind === "image") urls.add(backgroundUrl(element));
+      if (kind === "video") {
+        urls.add(safeHttpUrl(element.currentSrc || element.src));
+        urls.add(safeHttpUrl(element.poster));
+      }
+      if (kind === "document") urls.add(safeHttpUrl(element.href || element.getAttribute?.("href")));
+      urls.delete("");
+      return media.filter((item) => [item.url, item.posterUrl, ...(item.variants || []).map((variant) => variant.url)]
+        .some((url) => urls.has(url))).map((item) => item.id);
+    };
+    const kindFor = (element) => {
+      if (element.matches?.("video,iframe")) return element.matches("iframe") && !isSupportedVideoFrame(element) ? "" : "video";
+      if (element.matches?.("img") || backgroundUrl(element)) return "image";
+      if (element.matches?.("a[href]")) {
+        const sourceUrl = safeHttpUrl(element.href || element.getAttribute?.("href"));
+        if (!sourceUrl) return "";
+        if (attachmentDescriptor(element, sourceUrl, cleanText(element.textContent))) return "document";
+        if (isVideoUrl(sourceUrl)) return "video";
+        return "";
+      }
+      return cleanBlockText(element.textContent) ? "text" : "";
+    };
+    const candidates = renderedQueryAll(root, `${semanticSelector},div,section,figure`)
+      .filter((element) => !isPageChrome(element));
+    const leafElements = candidates.filter((element) => {
+      const kind = kindFor(element);
+      if (!kind) return false;
+      if (kind !== "text") return true;
+      if (element.matches?.(semanticSelector)) return true;
+      return !element.querySelector?.(`${semanticSelector},div,section`) && cleanBlockText(element.textContent);
+    });
+    const remainingTextBlocks = articleBlocks.filter((block) => !block.assetId);
+    const leaves = leafElements.flatMap((element, sourceOrder) => {
+      const kind = kindFor(element);
+      const text = kind === "text" ? readBlockText(element) : "";
+      const textIndex = kind === "text" ? remainingTextBlocks.findIndex((block) => cleanBlockText(block.text) === text
+        && (!genericCapture || (block.kind === "heading") === element.matches("h1,h2,h3,h4,h5,h6"))) : -1;
+      const articleBlockIds = textIndex >= 0 ? [remainingTextBlocks.splice(textIndex, 1)[0].id] : [];
+      const mediaIds = mediaIdsFor(element, kind);
+      if (kind !== "text" && !mediaIds.length) return [];
+      const path = pathFor(element);
+      if (!path) return [];
+      return [{
+        id: `content:${kind}:${sourceOrder}:${hashText(path)}`,
+        kind,
+        path,
+        groupId: "",
+        articleBlockIds,
+        mediaIds,
+        sourceOrder,
+        element
+      }];
+    });
+    const groups = candidates.filter((element) => element.matches?.("div,section,article,figure") && element !== root).flatMap((element) => {
+      const children = leaves.filter((target) => element.contains?.(target.element));
+      if (children.length < 2) return [];
+      const path = pathFor(element);
+      if (!path) return [];
+      const id = `content:group:${hashText(path)}`;
+      for (const child of children) if (!child.groupId) child.groupId = id;
+      return [{
+        id,
+        kind: "group",
+        path,
+        groupId: "",
+        articleBlockIds: [...new Set(children.flatMap((target) => target.articleBlockIds))],
+        mediaIds: [...new Set(children.flatMap((target) => target.mediaIds))],
+        sourceOrder: Math.min(...children.map((target) => target.sourceOrder))
+      }];
+    });
+    return [...leaves.map(({ element, ...target }) => target), ...groups]
+      .sort((left, right) => left.sourceOrder - right.sourceOrder || (left.kind === "group" ? 1 : -1));
+  }
+
+  function contentRootHtml(root, parts = []) {
+    const componentContent = root.shadowRoot || renderedElements(root).some(node => node.shadowRoot);
+    const pairs = [];
+    const cloneRendered = node => {
+      if (!(node instanceof Element)) return node.cloneNode(true);
+      const copy = node.localName.includes("-") || node.localName === "slot" ? document.createElement("div") : node.cloneNode(false);
+      if (node.localName.includes("-")) {
+        for (const attribute of node.attributes) copy.setAttribute(attribute.name, attribute.value);
+      }
+      pairs.push([node, copy]);
+      if (node.matches("img,video")) {
+        const source = safeHttpUrl(node.currentSrc || node.src);
+        if (source) copy.setAttribute("src", source);
+      }
+      const children = node.localName === "slot" ? node.assignedNodes({ flatten: true }) : (node.shadowRoot || node).childNodes;
+      for (const child of children || []) copy.append(cloneRendered(child));
+      return copy;
+    };
+    const fragment = componentContent && !parts.length ? cloneRendered(root) : root.cloneNode(!parts.length);
+    for (const part of parts) fragment.append(componentContent ? cloneRendered(part) : part.cloneNode(true));
+    if (genericCapture && root === genericRoot) {
+      const originals = componentContent ? pairs.map(([node]) => node) : [...root.querySelectorAll("*")];
+      const copies = componentContent ? pairs.map(([,copy]) => copy) : [...fragment.querySelectorAll("*")];
+      originals.forEach((node, index) => {
+        if (node.matches("script,style,template,noscript") || isPageChrome(node) || genericNodeHidden(node)
+          || node.matches("img,video,iframe,canvas") && isExcludedMedia(node)) copies[index]?.remove();
+      });
+      // Plain in-page tables of contents are navigation even without a nav tag.
+      for (const list of fragment.querySelectorAll("ul,ol")) {
+        const links = [...list.querySelectorAll("a")];
+        if (links.length && !list.querySelector("img,video") && links.every(link => {
+          const id = link.getAttribute("data-target") || link.getAttribute("href")?.replace(/^#/, "");
+          return id && (link.getAttribute("href") || "").startsWith("#") && root.querySelector(`[id="${CSS.escape(id)}"]`);
+        }) && cleanText(list.textContent) === cleanText(links.map(link => link.textContent).join(" "))) list.remove();
+      }
+    }
+    // Application templates are not visible article text. Remove them before
+    // leaf wrappers become paragraphs, otherwise textContent promotes their
+    // source markup into a saved article block (for example gallery lightboxes).
+    for (const node of fragment.querySelectorAll("script,style,template,noscript")) node.remove();
+    // Preserve editor paragraphs as semantic HTML for sectioning and saved reading order.
+    for (const node of fragment.querySelectorAll("div.zone-container.text-editor")) {
+      if (node.closest("h1,h2,h3,h4,h5,h6")) continue;
+      const paragraph = document.createElement("p");
+      paragraph.innerHTML = node.innerHTML;
+      // Editor line divs cannot survive inside a serialized HTML paragraph.
+      for (const line of paragraph.querySelectorAll("div")) {
+        const span = document.createElement("span");
+        span.innerHTML = line.innerHTML;
+        if (line.nextSibling) span.append(document.createElement("br"));
+        line.replaceWith(span);
+      }
+      node.replaceWith(paragraph);
+    }
+    // Rich-text publishers often use section/div wrappers instead of paragraph tags.
+    for (const node of fragment.querySelectorAll("div,section")) {
+      if (node.matches(".rde-asset-embed") || !cleanBlockText(node.textContent) || node.querySelector("div,section,p,h1,h2,h3,h4,h5,h6,ul,ol,blockquote,pre,table,figure,button,input,select,textarea")) continue;
+      const paragraph = document.createElement("p"); paragraph.innerHTML = node.innerHTML; node.replaceWith(paragraph);
+    }
+    return fragment.innerHTML;
+  }
+
+  function collectTextBlocks(root, contentHtml, contentText) {
+    let blockRoot = root;
+    if (contentHtml) {
+      try {
+        const template = document.createElement("template");
+        template.innerHTML = contentHtml;
+        blockRoot = template.content || template;
+      } catch {
+      }
+    }
+    const selector = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,code[data-language],figure,table";
+    const containers = "li,blockquote,pre,code[data-language],figure,table";
+    const blocks = [];
+    for (const node of renderedQueryAll(blockRoot, selector)) {
+      const parentContainer = node.parentElement?.closest?.(containers);
+      if (parentContainer && parentContainer !== node) continue;
+      const text = readBlockText(node);
+      if (!text) continue;
+      const tagName = cleanText(node.tagName).toLowerCase();
+      blocks.push({
+        id: "text:" + blocks.length + ":" + hashText(text),
+        text,
+        html: serializeBlockHtml(node),
+        kind: /^h[1-6]$/u.test(tagName)
+          ? "heading"
+          : isPageChrome(node)
+            ? "noise"
+            : tagName === "li" ? "list" : tagName === "blockquote" ? "quote" : ["pre", "code"].includes(tagName) ? "code" : tagName === "figure" ? "figure" : tagName === "table" ? "table" : "paragraph",
+        sourceOrder: blocks.length
+      });
+    }
+    if (blocks.length) return blocks;
+    const text = cleanBlockText(contentText);
+    return text ? [{ id: "text:0:" + hashText(text), text, html: String(contentHtml || "") }] : [];
+  }
+
+  function collectArticleDocument(root, contentHtml, textBlocks, knownMedia, limit) {
+    let blockRoot = root;
+    if (contentHtml) {
+      try {
+        const template = document.createElement("template");
+        template.innerHTML = contentHtml;
+        blockRoot = template.content || template;
+      } catch {
+      }
+    }
+    const media = [];
+    const blocks = [];
+    const textByValue = new Map();
+    for (const block of textBlocks || []) {
+      const key = cleanBlockText(block.text);
+      if (key) textByValue.set(key, [...(textByValue.get(key) || []), block]);
+    }
+    const downloadCards = [...(blockRoot.querySelectorAll?.(".rde-asset-embed") || [])];
+    const selector = "h1,h2,h3,h4,h5,h6,p,ul,ol,blockquote,pre,code[data-language],table,figcaption,img,video,iframe,a[href],.rde-asset-embed";
+    const structuralContainers = "p,ul,ol,blockquote,pre,code[data-language],table,figcaption";
+    const elements = [...(genericCapture && options.selectionTemplate && blockRoot?.matches?.(selector) ? [blockRoot] : []), ...renderedQueryAll(blockRoot, selector)];
+    for (const element of elements) {
+      if (isPageChrome(element)) continue;
+      const tagName = cleanText(element.tagName).toLowerCase();
+      // A table owns its cell blocks; keep their IDs in the flat asset/edit registry.
+      if (element.parentElement?.closest("table")) continue;
+      if (tagName === "table") {
+        const text = readBlockText(element);
+        const id = textByValue.get(text)?.shift()?.id || `article:table:${blocks.length}:${hashText(text)}`;
+        const tableBlock = { id, kind: "table", text, sourceOrder: blocks.length, rows: [] };
+        blocks.push(tableBlock);
+        for (const row of element.rows) {
+          const cells = [];
+          for (const cell of row.cells) {
+            const fragment = document.createElement("div");
+            fragment.innerHTML = cell.innerHTML;
+            // Preserve bare cell text alongside paragraphs and media.
+            for (const node of [...fragment.childNodes]) {
+              if (node.nodeType === 3 && cleanText(node.textContent)) {
+                const paragraph = document.createElement("p"); paragraph.textContent = node.textContent; node.replaceWith(paragraph);
+              }
+            }
+            const child = collectArticleDocument(fragment, fragment.innerHTML, [], [...knownMedia, ...media], limit);
+            media.push(...child.media);
+            const cellBlocks = child.blocks.map((block, index) => ({ ...block,
+              id: `${id}:cell:${tableBlock.rows.length}:${cells.length}:${index}`, sourceOrder: blocks.length + index }));
+            blocks.push(...cellBlocks);
+            cells.push({ header: cell.tagName === "TH", rowspan: cell.rowSpan, colspan: cell.colSpan,
+              width: Number(cell.getAttribute("width")) || parseFloat(cell.style.width) || 0,
+              align: cell.style.textAlign || cell.getAttribute("align"), valign: cell.style.verticalAlign || cell.getAttribute("valign"),
+              blockIds: cellBlocks.map(block => block.id) });
+          }
+          tableBlock.rows.push(cells);
+        }
+        continue;
+      }
+      if (element.matches?.(".rde-asset-embed")) {
+        const download = options.downloads?.items?.find((item) => item.index === downloadCards.indexOf(element));
+        if (download) {
+          const link = document.createElement("a");
+          link.href = download.url;
+          link.download = download.filename;
+          const attachment = attachmentDescriptor(link, download.url, download.filename);
+          if (attachment?.mimeType) {
+            attachment.id = `article:download:${hashText(`${download.index}:${download.filename}`)}`;
+            attachment.downloadDataUrl = download.downloadDataUrl;
+            media.push(attachment);
+            blocks.push({ id: attachment.id, kind: attachment.kind, assetId: attachment.id, sourceUrl: download.url, label: download.filename, mimeType: attachment.mimeType, sourceOrder: blocks.length });
+          }
+        }
+        continue;
+      }
+      if (element.matches?.("a[href]")) {
+        const sourceUrl = safeHttpUrl(element.href || element.getAttribute?.("href"));
+        if (!sourceUrl) continue;
+        const label = cleanText(element.textContent || element.getAttribute?.("download")) || filenameFromUrl(sourceUrl);
+        const attachment = attachmentDescriptor(element, sourceUrl, label);
+        if (attachment) {
+          if (attachment.mimeType) {
+            media.push(attachment);
+            blocks.push({ id: `article:document:${hashText(sourceUrl)}`, kind: attachment.kind, assetId: attachment.id, sourceUrl, label, mimeType: attachment.mimeType, sourceOrder: blocks.length });
+          } else {
+            blocks.push({ id: `article:link:${hashText(sourceUrl)}`, kind: "link", sourceUrl, label, sourceOrder: blocks.length });
+          }
+        } else if (isVideoUrl(sourceUrl)) {
+          const video = { id: `article:video:${hashText(sourceUrl)}`, kind: "video", url: sourceUrl, posterUrl: "", alt: label, captureMethod: "source" };
+          media.push(video);
+          blocks.push({ id: `article:video-link:${hashText(sourceUrl)}`, kind: "video", assetId: video.id, sourceUrl, label, sourceOrder: blocks.length });
+        }
+        continue;
+      }
+      if (element.matches?.("img")) {
+        if (blockRoot === root && root.isConnected !== false && isExcludedMedia(element)) continue;
+        if (playerForCompanionPoster(element, blockRoot)) continue;
+        const variants = collectImageVariants(element);
+        const sourceUrl = variants[0]?.url || safeHttpUrl(element.currentSrc || element.src);
+        const existing = knownMedia.find(item => item.id === element.getAttribute?.("data-promptdirector-asset-id")) || findKnownMedia(knownMedia, sourceUrl, variants, "image");
+        const item = existing || (sourceUrl ? {
+          id: `article:image:${hashText(sourceUrl)}`,
+          kind: "image",
+          url: sourceUrl,
+          posterUrl: "",
+          alt: cleanText(element.alt),
+          width: variants[0]?.declaredWidth || (sourceUrl === safeHttpUrl(element.currentSrc || element.src) ? Number(element.naturalWidth) || 0 : 0),
+          height: sourceUrl === safeHttpUrl(element.currentSrc || element.src) ? Number(element.naturalHeight) || 0 : 0,
+          captureMethod: "source",
+          sourceKind: variants[0]?.sourceKind || "source",
+          variants
+        } : null);
+        if (!item) continue;
+        if (!existing) media.push(item);
+        blocks.push({ id: `article:image-block:${hashText(item.id)}${genericCapture ? ":" + blocks.length : ""}`, kind: "image", assetId: item.id, sourceUrl: item.url, label: cleanText(item.alt), sourceOrder: blocks.length });
+        continue;
+      }
+      if (element.matches?.("video,iframe")) {
+        if (element.matches?.("iframe") && !isSupportedVideoFrame(element)) continue;
+        const sourceUrl = safeHttpUrl(element.currentSrc || element.src);
+        const posterElement = companionPosterForPlayer(element, blockRoot);
+        const posterUrl = safeHttpUrl(element.poster || "") || (posterElement ? collectImageVariants(posterElement)[0]?.url : "") || "";
+        const existing = findKnownMedia(knownMedia, sourceUrl || posterUrl, [], "video");
+        const item = existing || (sourceUrl || posterUrl ? {
+          id: `article:video:${hashText(sourceUrl || posterUrl)}`,
+          kind: "video",
+          url: sourceUrl,
+          posterUrl,
+          alt: cleanText(element.getAttribute?.("aria-label")),
+          captureMethod: "source"
+        } : null);
+        if (!item) continue;
+        if (!existing) media.push(item);
+        blocks.push({ id: `article:video-block:${hashText(item.id)}${genericCapture ? ":" + blocks.length : ""}`, kind: "video", assetId: item.id, sourceUrl: item.url, posterUrl: item.posterUrl, label: cleanText(item.alt), sourceOrder: blocks.length });
+        continue;
+      }
+      const parentContainer = element.parentElement?.closest?.(structuralContainers);
+      if (parentContainer && parentContainer !== element) continue;
+      const text = readBlockText(element);
+      if (!text) continue;
+      const known = textByValue.get(text)?.shift();
+      const kind = /^h[1-6]$/u.test(tagName)
+        ? "heading"
+        : ["ul", "ol"].includes(tagName) ? "list"
+          : tagName === "blockquote" ? "quote"
+            : ["pre", "code"].includes(tagName) ? "code"
+              : tagName === "table" ? "table" : "paragraph";
+      blocks.push({
+        id: known?.id || `article:text:${blocks.length}:${hashText(text)}`,
+        kind,
+        text,
+        ...(kind === "heading" ? { level: Number(tagName.slice(1)) || 2 } : {}),
+        ...(kind === "list" ? { ordered: tagName === "ol" } : {}),
+        sourceOrder: blocks.length
+      });
+    }
+    if (!blocks.length) {
+      for (const block of textBlocks || []) {
+        blocks.push({ id: block.id, kind: articleTextKind(block.kind), text: block.text, sourceOrder: blocks.length });
+      }
+    }
+    return { blocks, media: media.slice(0, Math.max(0, limit - knownMedia.length)) };
+  }
+
+  function articleTextKind(value) {
+    return ["heading", "paragraph", "list", "quote", "code", "table"].includes(value) ? value : "paragraph";
+  }
+
+  function findKnownMedia(values, sourceUrl, variants, kind) {
+    const urls = new Set([sourceUrl, ...(variants || []).map((item) => item.url)].filter(Boolean));
+    return (values || []).find((item) => item.kind === kind && [item.url, item.posterUrl, ...(item.variants || []).map((variant) => variant.url)].some((url) => urls.has(url))) || null;
+  }
+
+  function attachmentDescriptor(element, sourceUrl, label) {
+    const declaredType = cleanText(element.type || element.getAttribute?.("type")).toLocaleLowerCase("en-US").split(";", 1)[0];
+    const extension = cleanText(element.getAttribute?.("download")).split(".").at(-1)?.toLowerCase() || fileExtension(sourceUrl);
+    const mimeByExtension = {
+      skill: "application/zip",
+      pdf: "application/pdf",
+      md: "text/markdown",
+      markdown: "text/markdown",
+      txt: "text/plain",
+      html: "text/html",
+      htm: "text/html",
+      rtf: "application/rtf"
+    };
+    const mimeType = mimeByExtension[extension] || (/[\w.+-]+\/[\w.+-]+/u.test(declaredType) ? declaredType : "");
+    const explicitlyDownloadable = element.hasAttribute?.("download") || /\bdownload\b/iu.test(`${element.rel || ""} ${element.className || ""} ${element.getAttribute?.("aria-label") || ""}`);
+    if (!mimeType && !explicitlyDownloadable) return null;
+    return {
+      id: `article:document:${hashText(sourceUrl)}`,
+      kind: extension === "skill" ? "attachment" : "document",
+      url: sourceUrl,
+      filename: cleanText(element.getAttribute?.("download")) || label || filenameFromUrl(sourceUrl),
+      mimeType,
+      alt: label,
+      captureMethod: "source"
+    };
+  }
+
+  function fileExtension(value) {
+    try {
+      const name = new URL(value).pathname.split("/").filter(Boolean).at(-1) || "";
+      return cleanText(name.split(".").at(-1)).toLocaleLowerCase("en-US");
+    } catch {
+      return "";
+    }
+  }
+
+  function filenameFromUrl(value) {
+    try { return decodeURIComponent(new URL(value).pathname.split("/").filter(Boolean).at(-1) || ""); }
+    catch { return ""; }
+  }
+
+  function isVideoUrl(value) {
+    try {
+      const url = new URL(value);
+      if (url.hostname === "www.tiktok.com" && /^\/player\/v1\/\d+\/?$/u.test(url.pathname)) return true;
+      if (["x.com", "twitter.com"].some(host => url.hostname === host || url.hostname.endsWith(`.${host}`))) return /^\/[^/]+\/status\/\d+\/video\/\d+\/?$/u.test(url.pathname);
+      const host = url.hostname.replace(/^www\./u, "");
+      if (host === "youtube.com" || host.endsWith(".youtube.com")) return url.pathname === "/watch" && Boolean(url.searchParams.get("v")) || /^\/(?:shorts|embed|live)\/[^/]+/u.test(url.pathname);
+      if (host === "youtu.be") return /^\/[^/]+\/?$/u.test(url.pathname);
+      if (host === "bilibili.com" || host.endsWith(".bilibili.com")) return /^\/video\/(?:BV[\w]+|av\d+)/iu.test(url.pathname);
+      if (host === "vimeo.com" || host.endsWith(".vimeo.com")) return /^\/(?:video\/)?\d+\/?$/u.test(url.pathname);
+      if (host === "douyin.com" || host.endsWith(".douyin.com")) return /^\/video\/\d+/u.test(url.pathname);
+      return /\.(?:mp4|webm|mov)$/iu.test(url.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function structuredAuthorName(value) {
+    const authors = Array.isArray(value) ? value : value ? [value] : [];
+    return authors.map((author) => cleanText(typeof author === "string" ? author : author?.name)).filter(Boolean).join("、");
+  }
+
+  function structuredEngagement(value) {
+    const statistics = Array.isArray(value) ? value : value ? [value] : [];
+    const engagement = {};
+    for (const statistic of statistics) {
+      const type = cleanText(statistic?.interactionType?.["@type"] || statistic?.interactionType).toLocaleLowerCase("en-US");
+      const amount = Number(statistic?.userInteractionCount);
+      if (!Number.isFinite(amount) || amount < 0) continue;
+      if (type.includes("like")) engagement.likes = amount;
+      else if (type.includes("share")) engagement.shares = amount;
+      else if (type.includes("view") || type.includes("watch")) engagement.views = amount;
+    }
+    return engagement;
+  }
+
+  function collectStructuredMedia(value) {
+    const images = [];
+    const types = Array.isArray(value?.["@type"]) ? value["@type"] : [value?.["@type"]];
+    const videos = (types.includes("VideoObject") ? [value]
+      : Array.isArray(value?.video) ? value.video : value?.video ? [value.video] : []).flatMap(item => {
+      const source = safeHttpUrl(item?.contentUrl);
+      const embed = safeHttpUrl(item?.embedUrl);
+      const url = source || (embed && isVideoUrl(embed) ? embed : "");
+      if (!url) return [];
+      const posterUrl = safeHttpUrl(Array.isArray(item.thumbnailUrl) ? item.thumbnailUrl[0] : item.thumbnailUrl);
+      return [{ id: `structured-video:${hashText(url)}`, kind: "video", url, posterUrl,
+        width: Number(item.width?.value || item.width) || 0,
+        height: Number(item.height?.value || item.height) || 0,
+        sourceKind: source ? "site-original" : "structured", captureMethod: "source",
+        ...(/\.m3u8(?:\?|$)/iu.test(source) ? { streamUrl: source } : {}) }];
+    });
+    const addImage = (candidate) => {
+      const item = typeof candidate === "string" ? { url: candidate } : candidate || {};
+      const url = safeHttpUrl(item.contentUrl || item.url || item["@id"]);
+      if (!url) return;
+      const width = Number(item.width?.value || item.width) || 0;
+      const height = Number(item.height?.value || item.height) || 0;
+      images.push({
+        id: `structured:${hashText(url)}`,
+        kind: "image",
+        url,
+        width,
+        height,
+        sourceKind: "structured",
+        captureMethod: "source",
+        variants: [{ url, width, height, sourceKind: "structured" }]
+      });
+    };
+    if (types.includes("ImageObject") && value.contentUrl) addImage(value);
+    for (const image of Array.isArray(value?.image) ? value.image : value?.image ? [value.image] : []) addImage(image);
+    if (!images.length && !videos.length && value?.thumbnailUrl) addImage(Array.isArray(value.thumbnailUrl) ? value.thumbnailUrl[0] : value.thumbnailUrl);
+    const posters = new Set(videos.map(item => item.posterUrl).filter(Boolean));
+    return [...images.filter(item => !posters.has(item.url)), ...videos];
+  }
+
+  function readBlockText(node) {
+    if (!node.querySelector?.("br")) return cleanBlockText(node.textContent);
+    const clone = node.cloneNode(true);
+    for (const br of clone.querySelectorAll("br")) br.replaceWith("\n");
+    return cleanBlockText(clone.textContent);
+  }
+
+  function serializeBlockHtml(node) {
+    try {
+      const clone = node.cloneNode(true);
+      const elements = [clone, ...(clone.querySelectorAll?.("[href],[src],[poster]") || [])];
+      for (const element of elements) {
+        for (const attribute of ["href", "src", "poster"]) {
+          if (!element.hasAttribute?.(attribute)) continue;
+          const absoluteUrl = safeHttpUrl(element.getAttribute(attribute));
+          if (absoluteUrl) element.setAttribute(attribute, absoluteUrl);
+        }
+      }
+      return node.matches?.("code[data-language]") ? `<pre>${clone.outerHTML}</pre>` : String(clone.outerHTML || "");
+    } catch {
+      return String(node.outerHTML || "");
+    }
+  }
+
+  function collectAdapterFields(root, adapter) {
+    const fields = adapter?.fields && typeof adapter.fields === "object" ? adapter.fields : {};
+    const firstText = (selectors) => {
+      for (const selector of Array.isArray(selectors) ? selectors : []) {
+        try {
+          const node = root.querySelector(selector);
+          const value = cleanText(node?.getAttribute?.("datetime") || node?.textContent);
+          if (value) return value;
+        } catch {
+        }
+      }
+      return "";
+    };
+    const numeric = (name) => {
+      const text = firstText(fields[name]);
+      const match = text.replace(/,/g, "").match(/\d+(?:\.\d+)?/);
+      return match ? Number(match[0]) : null;
+    };
+    const firstUrl = (selectors) => {
+      for (const selector of Array.isArray(selectors) ? selectors : []) {
+        try {
+          const node = root.querySelector(selector);
+          const value = safeHttpUrl(node?.href || node?.getAttribute?.("href"));
+          if (value) return value;
+        } catch {
+        }
+      }
+      return "";
+    };
+    const handleFromLink = (selectors) => {
+      const value = firstUrl(selectors);
+      if (!value) return "";
+      try { return cleanText(new URL(value).pathname.split("/").filter(Boolean)[0]).replace(/^@/u, ""); }
+      catch { return ""; }
+    };
+    const engagement = Object.fromEntries(["likes", "reposts", "views"].flatMap((name) => {
+      const value = numeric(name);
+      return Number.isFinite(value) ? [[name, value]] : [];
+    }));
+    return {
+      title: firstText(fields.title),
+      author: firstText(fields.author),
+      handle: handleFromLink(fields.handle) || (adapter.id === "x" ? new URL(ownPostLinks(root)[0]?.href || location.href).pathname.split('/')[1] : ""),
+      canonicalUrl: adapter.id === "x" ? xPostCanonicalUrl(ownPostLinks(root)[0]?.href) : firstUrl(fields.canonicalUrl),
+      model: firstText(fields.model),
+      publishedAt: adapter.id === "x" ? cleanText(ownPostLinks(root)[0]?.querySelector("time")?.dateTime) : firstText(fields.publishedAt),
+      engagement
+    };
+  }
+
+  // Only inspect sources owned by this player. Global network traffic may belong to other works.
+  function collectVideoVariants(player) {
+    const urls = [player.currentSrc, player.getAttribute("src"), player.getAttribute("data-src"), player.getAttribute("data-video-src"),
+      ...[...player.querySelectorAll("source")].flatMap(source => [source.getAttribute("src"), source.getAttribute("data-src")])];
+    const host = player.getRootNode?.().host;
+    if (host && renderedQueryAll(host, "video").length === 1) {
+      urls.push(host.getAttribute("src"), ...[...host.children].filter(node => node.matches("source")).map(source => source.getAttribute("src")));
+    }
+    return [...new Set(urls.map(safeHttpUrl).filter(Boolean))].map(url => ({ url, sourceKind: "video-element" }));
+  }
+
+  function genericDetailReferences(element) {
+    if (!genericCapture || element.closest("[data-promptdirector-detail-blocked]")) return [];
+    const owner = element.closest("[hx-get],[data-hx-get],a[href]");
+    if (!owner || owner.closest("[data-promptdirector-detail-blocked],form,[hx-post],[hx-delete],[hx-put],[hx-patch],[hx-include],[hx-vals],[data-hx-vals]")) return [];
+    const fragment = owner.hasAttribute("hx-get") || owner.hasAttribute("data-hx-get");
+    const raw = fragment ? owner.getAttribute("hx-get") || owner.getAttribute("data-hx-get") : owner.getAttribute("href");
+    if (!raw || raw.startsWith("#") || owner.hasAttribute("download")) return [];
+    const detailUrl = safeHttpUrl(raw);
+    if (!detailUrl) return [];
+    const parsed = new URL(detailUrl);
+    if (parsed.origin !== location.origin || parsed.pathname === location.pathname && parsed.search === location.search
+      || /(?:^|[\/_?&=-])(?:logout|signout|delete|remove|unsubscribe|cart|checkout)(?:$|[\/_?&=-])/i.test(detailUrl)
+      || /\.(?:jpe?g|png|gif|webp|avif|svg|mp4|webm|pdf|zip)(?:$|[?#])/i.test(detailUrl)) return [];
+    return [{ url: detailUrl, fragment }];
+  }
+
+  function collectMedia(root, limit, selectedContent = false) {
+    const media = [];
+    for (const [elementIndex, element] of [...((selectedContent || genericCapture && options.selectionTemplate) && root.matches("img,video,iframe,canvas") ? [root] : []), ...renderedQueryAll(root, "img,video,iframe,canvas")].entries()) {
+      if (isExcludedMedia(element)) continue;
+      if (selectedContent && composedClosest(element, 'button,input,textarea,select')) continue;
+      if (element.matches?.("img") && playerForCompanionPoster(element, root)) continue;
+      if (element instanceof HTMLCanvasElement) {
+        try {
+          const maxPixels = Number(options.maxCanvasPixels) || maxInlinePixelDataCharacters / 8;
+          if (element.width * element.height > maxPixels) throw Object.assign(new Error('画布超过本次像素读取预算；页面原件保留'), { code: 'RESOURCE_BUDGET_REACHED' });
+          const dataUrl = reserveInlinePixels(element.toDataURL("image/webp", 0.92));
+          if (dataUrl.length <= maxInlinePixelDataCharacters) {
+            media.push({ id: `canvas:${elementIndex}:${element.width}x${element.height}`, kind: "image", url: "", dataUrl, posterUrl: "", alt: cleanText(element.getAttribute("aria-label")), width: element.width, height: element.height, captureMethod: "pixel-fallback" });
+          }
+        } catch (error) {
+          if (error.code === "RESOURCE_BUDGET_REACHED") throw error;
+          if (selectedContent) {
+            const pixels = selectedPixelFallback(element, elementIndex);
+            if (pixels) media.push(pixels);
+          }
+        }
+        if (media.length >= limit) break;
+        continue;
+      }
+      if (element.matches("iframe") && !isSupportedVideoFrame(element)) {
+        if (selectedContent) {
+          const pixels = selectedPixelFallback(element, elementIndex);
+          if (pixels) media.push(pixels);
+        }
+        continue;
+      }
+      const kind = element.matches("video,iframe") ? "video" : "image";
+      const variants = kind === "image" ? collectImageVariants(element)
+        : element.matches("video") ? collectVideoVariants(element) : [];
+      const imageSource = variants[0] || null;
+      const url = imageSource?.url || safeHttpUrl(element.currentSrc || element.src);
+      const posterElement = kind === "video" ? companionPosterForPlayer(element, root) : null;
+      const posterUrl = kind === "video" ? safeHttpUrl(element.poster || "") || (posterElement ? collectImageVariants(posterElement)[0]?.url : "") || "" : "";
+      const deferredReveal = genericCapture && url && Number(getComputedStyle(element).opacity) === 0;
+      const pixelFallback = kind === "image" && !deferredReveal ? visibleImagePixels(element) : "";
+      if (!url && !posterUrl && !pixelFallback) continue;
+      const rect = element.getBoundingClientRect();
+      const fallbackRect = kind === "image" && !deferredReveal && rect.width >= 48 && rect.height >= 48 && rect.bottom >= 0 && rect.top <= (Number(window.innerHeight) || 720)
+        ? { rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, viewportWidth: Number(window.innerWidth) || document.documentElement.clientWidth, viewportHeight: Number(window.innerHeight) || document.documentElement.clientHeight }
+        : null;
+      const responsiveCandidate = Boolean(imageSource?.declaredWidth || imageSource?.density > 1
+        || kind === "image" && url !== safeHttpUrl(element.currentSrc || element.src));
+      media.push({
+        id: `${kind}:${elementIndex}:${hashText(cleanText(element.alt || element.getAttribute?.("aria-label")))}`,
+        kind,
+        url,
+        posterUrl,
+        ...(/\.m3u8(?:[?#]|$)/iu.test(url) ? { streamUrl: url } : {}),
+        postMediaUrl: xPostMediaUrl(element), isQuoted: Boolean(xQuoteContainer(element)),
+        ...(genericCapture ? { detailRequests: genericDetailReferences(element) } : {}),
+        alt: cleanText(element.alt),
+        width: imageSource?.declaredWidth || (responsiveCandidate ? 0 : Number(element.naturalWidth || element.videoWidth || element.width) || 0),
+        height: responsiveCandidate ? 0 : Number(element.naturalHeight || element.videoHeight || element.height) || 0,
+        captureMethod: "source",
+        sourceKind: imageSource?.sourceKind || (element.matches("video") ? "video-element" : "current"),
+        declaredWidth: imageSource?.declaredWidth || 0,
+        density: imageSource?.density || 0,
+        variants,
+        ...(fallbackRect ? { fallbackRect } : {}),
+        ...(pixelFallback ? { dataUrl: pixelFallback, previewDataUrl: pixelFallback } : {})
+      });
+      if (media.length >= limit) break;
+    }
+    if (media.length < limit) {
+      for (const element of selectedContent ? [root, ...renderedElements(root)] : root.querySelectorAll("*")) {
+        if (isExcludedMedia(element)) continue;
+        if (selectedContent && composedClosest(element, 'button,input,textarea,select')) continue;
+        const match = getComputedStyle(element).backgroundImage.match(/url\(["']?([^"')]+)["']?\)/i);
+        const url = safeHttpUrl(match?.[1]);
+        const rect = element.getBoundingClientRect();
+        if (!url || sameUrl(url, location.href) || rect.width < 48 || rect.height < 48) continue;
+        media.push({ id: `background:${hashText(url)}`, kind: "image", url, postMediaUrl: xPostMediaUrl(element), isQuoted: Boolean(xQuoteContainer(element)), posterUrl: "", alt: "", width: element.clientWidth, height: element.clientHeight, captureMethod: "css-background", sourceKind: "css-background", variants: [{ url, sourceKind: "css-background", width: element.clientWidth, height: element.clientHeight }] });
+        if (media.length >= limit) break;
+      }
+    }
+    const seen = new Map();
+    return media.filter((item) => {
+      const key = item.url || item.posterUrl || item.dataUrl || item.fallbackRect?.marker;
+      if (!key) return false;
+      const previous = seen.get(key);
+      if (previous) {
+        if (genericCapture && item.detailRequests?.length) previous.detailRequests = [...new Map(
+          [...(previous.detailRequests || []), ...item.detailRequests].map(request => [request.url, request])).values()];
+        return false;
+      }
+      seen.set(key, item);
+      return true;
+    });
+  }
+
+  function selectedPixelFallback(element, index) {
+    const bounds = element.getBoundingClientRect();
+    const rect = { x: Math.max(0, bounds.x), y: Math.max(0, bounds.y),
+      width: Math.max(0, Math.min(innerWidth, bounds.right) - Math.max(0, bounds.x)),
+      height: Math.max(0, Math.min(innerHeight, bounds.bottom) - Math.max(0, bounds.y)) };
+    if (!rect.width || !rect.height) {
+      selectedContentErrors.push('所选画面不在可见区域，请滚动到画面后重新选择；当前草稿保留');
+      return null;
+    }
+    const marker = crypto.randomUUID();
+    element.setAttribute('data-promptdirector-selected-pixels', marker);
+    return { id: `selected-pixels:${index}`, kind: 'image', url: '', width: rect.width, height: rect.height,
+      captureMethod: 'pixel-fallback', fallbackRect: { marker, rect, viewportWidth: innerWidth, viewportHeight: innerHeight } };
+  }
+
+  function companionPosterForPlayer(player, root) {
+    if (!player?.matches?.("video,iframe")) return null;
+    const figure = player.closest?.("figure,[role=group]");
+    const container = figure && root.contains?.(figure) ? figure : player.parentElement;
+    if (!container || !root.contains?.(container)) return null;
+    const players = [...container.querySelectorAll?.("video,iframe") || []].filter((item) => item.matches?.("video") || isSupportedVideoFrame(item));
+    const images = [...container.querySelectorAll?.("img") || []].filter((image) => {
+      const link = image.closest?.("a[href]");
+      const linkedUrl = safeHttpUrl(link?.href || link?.getAttribute?.("href"));
+      return !linkedUrl || !/\.(?:avif|gif|jpe?g|png|webp)(?:$|[?#])/iu.test(linkedUrl);
+    });
+    return players.length === 1 && images.length === 1 ? images[0] : null;
+  }
+
+  function playerForCompanionPoster(image, root) {
+    if (!image?.matches?.("img")) return null;
+    const figure = image.closest?.("figure,[role=group]");
+    const container = figure && root.contains?.(figure) ? figure : image.parentElement;
+    if (!container || !root.contains?.(container)) return null;
+    const player = [...container.querySelectorAll?.("video,iframe") || []]
+      .find((item) => item.matches?.("video") || isSupportedVideoFrame(item));
+    return player && companionPosterForPlayer(player, root) === image ? player : null;
+  }
+
+  function collectImageVariants(image) {
+    const pictureCandidates = [];
+    const imageCandidates = [];
+    const addSrcset = (value, sourceKind, target) => {
+      for (const candidate of parseSrcset(value)) {
+        const url = safeHttpUrl(candidate.url);
+        if (url) target.push({ ...candidate, url, sourceKind });
+      }
+    };
+    const picture = image.closest?.("picture");
+    for (const source of picture?.querySelectorAll?.("source[srcset],source[data-srcset]") || []) {
+      const media = cleanText(source.getAttribute("media"));
+      if (media && typeof window.matchMedia === "function" && !window.matchMedia(media).matches) continue;
+      addSrcset(source.getAttribute("srcset") || source.getAttribute("data-srcset"), "picture-srcset", pictureCandidates);
+      if (pictureCandidates.length) break;
+    }
+    addSrcset(image.getAttribute?.("srcset") || image.srcset, "img-srcset", imageCandidates);
+    addSrcset(image.getAttribute?.("data-srcset") || image.getAttribute?.("data-lazy-srcset"), "deferred-srcset", imageCandidates);
+    const candidates = [];
+    for (const attribute of [
+      "data-full-image", "data-full", "data-full-size", "data-hi-res", "data-high-res", "data-hires",
+      "data-zoom-image", "data-large-image", "data-large", "data-src-large", "data-image-url", "data-pin-media",
+      "data-orig-file", "data-original", "data-original-src", "data-src-original"
+    ]) {
+      const originalUrl = safeHttpUrl(image.getAttribute?.(attribute));
+      if (originalUrl) candidates.push({ url: originalUrl, sourceKind: "site-original", declaredWidth: urlWidthHint(originalUrl), density: 0 });
+    }
+    const imageLink = image.closest?.("a[href]");
+    const linkedUrl = safeHttpUrl(imageLink?.href || imageLink?.getAttribute?.("href"));
+    if (linkedUrl && (imageLink?.hasAttribute?.("download") || /\.(?:avif|gif|jpe?g|png|webp)(?:$|[?#])/iu.test(linkedUrl))) {
+      candidates.push({ url: linkedUrl, sourceKind: "site-original", declaredWidth: 0, density: 0 });
+    }
+    candidates.push(...pictureCandidates, ...imageCandidates);
+    for (const attribute of ["data-lazy-src", "data-src"]) {
+      const deferredUrl = safeHttpUrl(image.getAttribute?.(attribute));
+      if (deferredUrl) candidates.push({ url: deferredUrl, sourceKind: "deferred-src", declaredWidth: 0, density: 0 });
+    }
+    const currentUrl = safeHttpUrl(image.currentSrc);
+    if (currentUrl) candidates.push({ url: currentUrl, sourceKind: "current", declaredWidth: 0, density: 0 });
+    const sourceUrl = image.getAttribute?.("src") === "" ? "" : safeHttpUrl(image.src);
+    if (sourceUrl) candidates.push({ url: sourceUrl, sourceKind: "source", declaredWidth: 0, density: 0 });
+    const adapter = detectAdapter(location.hostname);
+    if (adapter.id === "higgsfield") {
+      for (const candidate of [...candidates]) {
+        try {
+          const proxy = new URL(candidate.url);
+          const source = proxy.hostname === "images.higgs.ai" ? proxy.searchParams.get("url")
+            : proxy.hostname === location.hostname && proxy.pathname.startsWith("/cdn-cgi/image/")
+              ? proxy.pathname.slice(proxy.pathname.indexOf("/https://") + 1) : "";
+          if (!source) continue;
+          const original = new URL(source);
+          if (original.protocol !== "https:" || !adapter.trustedMediaHosts.some((host) => original.hostname === host || original.hostname.endsWith(`.${host}`))) continue;
+          candidates.push({ url: original.href, sourceKind: "site-original", declaredWidth: 0, density: 0 });
+        } catch {
+        }
+      }
+    }
+    const seen = new Set();
+    return candidates.sort((left, right) => imageVariantScore(right) - imageVariantScore(left))
+      .filter((candidate) => candidate.url && !seen.has(candidate.url) && seen.add(candidate.url));
+  }
+
+  function urlWidthHint(value) {
+    try {
+      const url = new URL(value);
+      for (const key of ["width", "w", "resize", "size"]) {
+        const match = String(url.searchParams.get(key) || "").match(/\d{2,6}/u);
+        const width = Number(match?.[0]);
+        if (Number.isSafeInteger(width) && width > 0) return width;
+      }
+    } catch {
+    }
+    return 0;
+  }
+
+  function visibleImagePixels(image) {
+    try {
+      if (!image.complete || !image.naturalWidth || !image.naturalHeight) return "";
+      const rect = image.getBoundingClientRect();
+      if (rect.width < 48 || rect.height < 48 || rect.bottom < 0 || rect.top > (Number(window.innerHeight) || 720)) return "";
+      const pixelBudget = Math.max(1, Math.floor(maxInlinePixelDataCharacters * 0.72 / 4));
+      const requestedScale = Math.max(1, Number(window.devicePixelRatio) || 1);
+      const scale = Math.min(requestedScale, Math.sqrt(pixelBudget / Math.max(1, rect.width * rect.height)));
+      const width = Math.max(1, Math.round(rect.width * scale));
+      const height = Math.max(1, Math.round(rect.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext("2d", { alpha: false })?.drawImage(image, 0, 0, width, height);
+      const dataUrl = canvas.toDataURL("image/webp", 0.92);
+      return reserveInlinePixels(dataUrl);
+    } catch (error) {
+      if (error.code === "RESOURCE_BUDGET_REACHED") throw error;
+      return "";
+    }
+  }
+
+  function imageVariantScore(value) {
+    const sourcePriority = {
+      "site-original": 1000000,
+      "picture-srcset": 500000,
+      structured: 550000,
+      "deferred-srcset": 450000,
+      "deferred-src": 400000,
+      "img-srcset": 350000,
+      "css-background": 250000,
+      current: 200000,
+      source: 100000
+    }[value?.sourceKind] || 0;
+    return sourcePriority + Math.min(99999, Number(value?.width || value?.declaredWidth || 0)) + Math.min(99, Number(value?.density || 0) * 10);
+  }
+
+  function isSupportedVideoFrame(element) {
+    const url = safeHttpUrl(element.src);
+    if (!url) return false;
+    try {
+      const parsed = new URL(url);
+      const host = parsed.hostname.toLocaleLowerCase("en-US");
+      if (parsed.protocol === "https:" && (options.videoFrameRules || []).some(rule =>
+        host === rule.host && parsed.pathname.startsWith(rule.pathPrefix) && parsed.pathname.endsWith(rule.pathSuffix))) return true;
+      if (host === "www.tiktok.com") return /^\/player\/v1\/\d+\/?$/u.test(new URL(element.src).pathname);
+      return ["youtube.com", "youtube-nocookie.com", "youtu.be", "player.vimeo.com", "player.bilibili.com", "douyin.com", "open.douyin.com"].some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+    } catch {
+      return false;
+    }
+  }
+
+  function mergeCollectedMedia(values, limit) {
+    const seenIds = new Set();
+    const seenUrls = new Set();
+    return values.flatMap((item, index) => {
+      if (!item || typeof item !== "object") return [];
+      const variants = (Array.isArray(item.variants) ? item.variants : []).filter((variant) => safeHttpUrl(variant?.url));
+      const primaryUrl = safeHttpUrl(item.url) || variants[0]?.url || "";
+      const itemKind = ["video", "document", "attachment"].includes(item.kind) ? item.kind : "image";
+      const id = cleanText(item.id) || `${itemKind}:${index}:${hashText(primaryUrl || item.dataUrl)}`;
+      const identity = item.downloadDataUrl ? id : primaryUrl;
+      if (seenIds.has(id) || identity && seenUrls.has(identity)) return [];
+      seenIds.add(id);
+      if (identity) seenUrls.add(identity);
+      return [{ ...item, id, kind: itemKind, url: primaryUrl, variants }];
+    }).slice(0, limit);
+  }
+
+  function parseSrcset(value) {
+    const input = String(value || "");
+    const candidates = [];
+    let position = 0;
+    while (position < input.length) {
+      while (position < input.length && (input[position] === "," || /\s/.test(input[position]))) position += 1;
+      if (position >= input.length) break;
+      const urlStart = position;
+      while (position < input.length && !/\s/.test(input[position])) position += 1;
+      let url = input.slice(urlStart, position);
+      const descriptors = [];
+      if (url.endsWith(",")) {
+        url = url.replace(/,+$/, "");
+      } else {
+        while (position < input.length) {
+          while (position < input.length && /\s/.test(input[position])) position += 1;
+          if (input[position] === ",") {
+            position += 1;
+            break;
+          }
+          const descriptorStart = position;
+          while (position < input.length && input[position] !== "," && !/\s/.test(input[position])) position += 1;
+          if (position > descriptorStart) descriptors.push(input.slice(descriptorStart, position));
+        }
+      }
+      const widthDescriptor = descriptors.find((item) => /^\d+w$/.test(item));
+      const densityDescriptor = descriptors.find((item) => /^(?:\d+|\d*\.\d+)x$/.test(item));
+      candidates.push({
+        url,
+        declaredWidth: widthDescriptor ? Number.parseInt(widthDescriptor, 10) : 0,
+        density: densityDescriptor ? Number.parseFloat(densityDescriptor) : descriptors.length ? 0 : 1
+      });
+    }
+    return candidates;
+  }
+
+  function xQuoteContainer(element) {
+    if (!["x.com", "twitter.com"].includes(location.hostname)) return null;
+    const post = element.closest('article');
+    const quote = element.closest('[data-testid="quoteTweet"], [role="link"][tabindex="0"]');
+    return post && quote && post.contains(quote) && post !== quote ? quote : null;
+  }
+
+  function xPostMediaUrl(element) {
+    const photoUrl = xPostPhotoUrl(element);
+    if (photoUrl) return photoUrl;
+    if (!["x.com", "twitter.com"].includes(location.hostname) || !element.matches("video")) return "";
+    const post = element.closest('article');
+    if (!post) return "";
+    const quote = xQuoteContainer(element);
+    const link = quote
+      ? [...quote.querySelectorAll('a[href*="/status/"]')].find(node => node.querySelector("time"))
+      : ownPostLinks(post)[0];
+    return xPostCanonicalUrl(link?.href);
+  }
+
+  function xPostPhotoUrl(element) {
+    if (!["x.com", "twitter.com"].includes(location.hostname) || !element.closest('article')) return "";
+    const link = element.closest('a[href*="/photo/"]');
+    const url = safeHttpUrl(link?.href);
+    if (!url) return "";
+    const match = new URL(url).pathname.match(/^\/([^/]+)\/status\/(\d+)\/photo\/\d+\/?$/);
+    return match ? new URL(`/${match[1]}/status/${match[2]}`, url).href : "";
+  }
+
+  function genericNodeHidden(element) {
+    if (!element || element === document.body) return false;
+    if (hiddenGenericNodes.has(element)) return hiddenGenericNodes.get(element);
+    const style = getComputedStyle(element);
+    const hidden = element.matches?.('[hidden],[aria-hidden="true"],template,dialog:not([open])')
+      || style.display === "none" || style.visibility === "hidden" || genericNodeHidden(composedParent(element));
+    hiddenGenericNodes.set(element, Boolean(hidden));
+    return Boolean(hidden);
+  }
+
+  function isExcludedMedia(element) {
+    if (options.manualContentHtml) return false;
+    if (options.siteData?.adapter === "krea" && options.siteData?.pageKind === "detail") {
+      const link = element.closest?.("a[href]");
+      try {
+        const url = new URL(link?.href);
+        if ((url.hostname === "krea.ai" || url.hostname.endsWith(".krea.ai"))
+          && url.pathname.startsWith("/feed/") && url.pathname !== new URL(options.siteData.canonicalUrl).pathname) return true;
+      } catch { /* This media is not a link to another Krea work. */ }
+    }
+    if (genericCapture && (isPageChrome(element) || genericNodeHidden(element))) return true;
+    const postPhoto = Boolean(xPostPhotoUrl(element));
+    const postVideo = element.matches("video") && Boolean(xPostMediaUrl(element));
+    if (!postPhoto && !postVideo && composedClosest(element, "nav,aside,header,[role=banner],[aria-label*=广告],[aria-label*=advertisement]")) return true;
+    const rect = element.getBoundingClientRect();
+    // X may defer intrinsic dimensions until a photo is opened. Its owned
+    // photo link plus a real source identifies the asset without decoding it.
+    const deferredPostPhoto = postPhoto && element.matches("img") && collectImageVariants(element).length > 0;
+    const deferredPostVideo = postVideo && Boolean(safeHttpUrl(element.poster) || collectVideoVariants(element).length);
+    // A lazy image can have a real source before its reveal animation starts.
+    // Do not extend this exception to collapsed tabs, dialogs or hidden ancestors.
+    const deferredGenericImage = genericCapture && element.matches("img")
+      && (element.loading === "lazy" || element.hasAttribute("data-src") || element.hasAttribute("data-lazy-src"))
+      && collectImageVariants(element).length > 0
+      && (rect.width >= 48 && rect.height >= 48
+        || Number(element.getAttribute("width")) >= 48 && Number(element.getAttribute("height")) >= 48);
+    if (!deferredPostPhoto && !deferredPostVideo && !deferredGenericImage && (rect.width < 48 || rect.height < 48)) return true;
+    const style = typeof globalThis.getComputedStyle === "function" ? globalThis.getComputedStyle(element) : null;
+    if (style?.display === "none" || style?.visibility === "hidden" || !postPhoto && !deferredGenericImage && Number(style?.opacity) === 0) return true;
+    if (genericCapture) {
+      const decorative = `${element.className || ""} ${element.id || ""}`;
+      return /(?:^|[\s_-])(?:avatar|emoji|icon|logo|badge|advert|qrcode)(?:$|[\s_-])/i.test(decorative)
+        || /^(?:avatar|emoji|icon|logo|badge|advertisement|qr[-_ ]?code|二维码)$/i.test(cleanText(element.alt));
+    }
+    const description = `${element.alt || ""} ${element.className || ""} ${element.id || ""} ${element.getAttribute?.("aria-label") || ""}`.toLowerCase();
+    return !postPhoto && /avatar|emoji|icon|logo|badge|advert|qr[-_ ]?code|二维码/.test(description);
+  }
+
+  function isContentRoot(root) {
+    if (!(root instanceof HTMLElement) || root.closest("nav,aside,header,[role=banner]")) return false;
+    return cleanText(root.innerText).length > 20 || renderedQueryAll(root, "img,video,iframe,canvas").length || genericCapture && options.selectionTemplate && root.matches("img,video,iframe,canvas");
+  }
+
+  function sameUrl(value, expected) {
+    return safeHttpUrl(typeof value === "object" ? value?.["@id"] : value) === expected;
+  }
+
+  function itemIdFromUrl(value) {
+    const postId = xPostIdentity(value);
+    if (postId) return postId;
+    try {
+      const parts = new URL(value).pathname.split("/").filter(Boolean);
+      return cleanText(parts.at(-1));
+    } catch {
+      return "";
+    }
+  }
+
+  function safeHttpUrl(value) {
+    try {
+      const input = String(value || "").trim();
+      if (!input) return "";
+      const url = new URL(input, document.baseURI);
+      return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function cleanText(value) {
+    return String(value ?? "").replace(/\s+/g, " ").trim();
+  }
+
+  function cleanBlockText(value) {
+    return String(value ?? "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+      .replace(/[\t ]+/g, " ")
+      .replace(/ *\n */g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function hashText(value) {
+    let hash = 2166136261;
+    for (const character of String(value)) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+    return (hash >>> 0).toString(36);
+  }
+
+  function positiveInteger(value, fallback) {
+    const number = Math.trunc(Number(value));
+    return Number.isSafeInteger(number) && number > 0 ? number : fallback;
+  }
+}
+
+function uniqueCandidates(values) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : []).flatMap((value) => {
+    const candidate = normalizePageCaptureCandidate(value);
+    const key = candidate ? `${candidate.canonicalUrl}\n${candidate.sourceFacts.itemId}\n${candidate.title}\n${candidate.region?.id || ""}\n${JSON.stringify(candidate.sourceFacts.captureSourceSelectors || [])}` : "";
+    if (!candidate || seen.has(key)) return [];
+    seen.add(key);
+    return [candidate];
+  });
+}
+
+function uniqueMedia(values) {
+  const items = [];
+  const indexById = new Map();
+  const indexByIdentity = new Map();
+  for (const value of Array.isArray(values) ? values : []) {
+    const variants = normalizeMediaVariants(value);
+    const url = variants[0]?.url || safeUrl(value?.url);
+    const changedImageSource = (!value?.kind || value.kind === "image") && url !== safeUrl(value?.url);
+    const posterUrl = safeUrl(value?.posterUrl);
+    const dataUrl = safeImageDataUrl(value?.dataUrl);
+    const previewDataUrl = safeImageDataUrl(value?.previewDataUrl);
+    const id = clean(value?.id) || stableCandidateId(url || posterUrl || dataUrl || previewDataUrl, value?.kind);
+    const keyUrl = url || posterUrl;
+    const kind = ["video", "document", "attachment"].includes(value?.kind) ? value.kind : "image";
+    const localAssetId = clean(value?.localAssetId);
+    if (!keyUrl && !dataUrl && !previewDataUrl && !localAssetId) continue;
+    const item = {
+      id,
+      kind,
+      placement: value?.placement === "inline" ? "inline" : "unplaced",
+      ...(localAssetId ? { localAssetId } : {}),
+      ...(clean(value?.localTransferId) ? { localTransferId: clean(value.localTransferId) } : {}),
+      ...(value?.contentHash ? { contentHash: clean(value.contentHash) } : {}),
+      ...(value?.isQuoted === true ? { isQuoted: true } : {}),
+      ...(safeUrl(value?.quotedPostUrl) ? { quotedPostUrl: safeUrl(value.quotedPostUrl) } : {}),
+      ...(value?.isCover === true && kind === "image" ? { isCover: true } : {}),
+      url,
+      posterUrl,
+      ...(safeUrl(value.streamUrl) ? { streamUrl: safeUrl(value.streamUrl) } : {}),
+      ...(safeUrl(value.videoStreams?.videoUrl) && safeUrl(value.videoStreams?.audioUrl) ? { videoStreams: {
+        videoUrl: safeUrl(value.videoStreams.videoUrl), audioUrl: safeUrl(value.videoStreams.audioUrl)
+      } } : {}),
+      ...(dataUrl ? { dataUrl } : {}),
+      ...(previewDataUrl ? { previewDataUrl } : {}),
+      ...(normalizeFallbackRect(value?.fallbackRect) ? { fallbackRect: normalizeFallbackRect(value.fallbackRect) } : {}),
+      variants,
+      alt: cleanCaptureImageDescription(value.alt),
+      ...(clean(value.originalPrompt) ? { originalPrompt: normalizeText(value.originalPrompt) } : {}),
+      filename: clean(value.filename),
+      mimeType: clean(value.mimeType).toLocaleLowerCase("en-US"),
+      ...(["document", "attachment"].includes(kind) && /^data:(?:text\/[a-z0-9.+-]+|application\/(?:pdf|rtf|zip|gzip|x-gzip|octet-stream))(?:;charset=[a-z0-9-]+)?;base64,[a-z0-9+/=]+$/i.test(value.downloadDataUrl || "")
+        && value.downloadDataUrl.length <= LIBRARY_TRANSFER_LIMITS.maxLibraryJsonBytes ? { downloadDataUrl: value.downloadDataUrl } : {}),
+      ...(Array.isArray(value.detailRequests) ? { detailRequests: value.detailRequests.flatMap(request => {
+        const url = safeUrl(request?.url); return url ? [{ url, fragment: request.fragment === true }] : [];
+      }) } : {}),
+      ...(Array.isArray(value.detailBlockIds) ? { detailBlockIds: value.detailBlockIds.map(clean).filter(Boolean) } : {}),
+      sourceTitle: cleanCaptureImageDescription(value.sourceTitle),
+      sourceAuthor: clean(value.sourceAuthor),
+      originalWorkUrl: safeUrl(value.originalWorkUrl),
+      width: positiveInteger(variants[0]?.width || (changedImageSource ? 0 : value.width), 0),
+      height: positiveInteger(variants[0]?.height || (changedImageSource ? 0 : value.height), 0),
+      sourceKind: variants[0]?.sourceKind || normalizeMediaSourceKind(value.sourceKind),
+      declaredWidth: positiveInteger(variants[0]?.declaredWidth || (changedImageSource ? 0 : value.declaredWidth), 0),
+      density: positiveNumber(variants[0]?.density || value.density, 0),
+      captureMethod: ["source", "css-background", "page-session", "pixel-fallback"].includes(value.captureMethod) ? value.captureMethod : "source"
+    };
+    const identity = item.downloadDataUrl ? id : kind === "image" ? pageCaptureMediaIdentity(url) : keyUrl;
+    const existingIndex = indexById.get(id) ?? (identity ? indexByIdentity.get(identity) : undefined);
+    if (existingIndex !== undefined) {
+      const existing = items[existingIndex];
+      const mergedVariants = normalizeMediaVariants({ ...existing, variants: [...existing.variants, ...item.variants] });
+      items[existingIndex] = {
+        ...existing,
+        url: mergedVariants[0]?.url || existing.url,
+        variants: mergedVariants,
+        width: positiveInteger(mergedVariants[0]?.width || existing.width || item.width, 0),
+        height: positiveInteger(mergedVariants[0]?.height || existing.height || item.height, 0),
+        sourceKind: mergedVariants[0]?.sourceKind || existing.sourceKind,
+        declaredWidth: positiveInteger(mergedVariants[0]?.declaredWidth || existing.declaredWidth || item.declaredWidth, 0),
+        density: positiveNumber(mergedVariants[0]?.density || existing.density || item.density, 0),
+        dataUrl: existing.dataUrl || item.dataUrl,
+        previewDataUrl: existing.previewDataUrl || item.previewDataUrl,
+        fallbackRect: existing.fallbackRect || item.fallbackRect,
+        alt: existing.alt || item.alt,
+        ...((existing.originalPrompt || item.originalPrompt) ? { originalPrompt: existing.originalPrompt || item.originalPrompt } : {}),
+        placement: existing.placement === "inline" || item.placement === "inline" ? "inline" : "unplaced"
+      };
+      indexById.set(id, existingIndex);
+      continue;
+    }
+    const index = items.push(item) - 1;
+    indexById.set(id, index);
+    if (identity) indexByIdentity.set(identity, index);
+  }
+  return items;
+}
+
+export function pageCaptureMediaIdentity(value) {
+  try {
+    const url = new URL(value);
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(?:w|width|h|height|q|quality|resize|size|dpr|format)$/iu.test(key)) url.searchParams.delete(key);
+    }
+    if (url.hostname === "pbs.twimg.com" && url.pathname.startsWith("/media/")) url.searchParams.delete("name");
+    url.hash = "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function normalizeFallbackRect(value) {
+  const rect = value?.rect;
+  const numbers = [rect?.x, rect?.y, rect?.width, rect?.height, value?.viewportWidth, value?.viewportHeight].map(Number);
+  if (!numbers.every(Number.isFinite) || numbers[2] <= 0 || numbers[3] <= 0 || numbers[4] <= 0 || numbers[5] <= 0) return null;
+  return {
+    rect: { x: numbers[0], y: numbers[1], width: numbers[2], height: numbers[3] },
+    viewportWidth: numbers[4],
+    viewportHeight: numbers[5]
+  };
+}
+
+function xOriginalImageUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== "pbs.twimg.com" || url.username || url.password
+      || !/^\/media\/[A-Za-z0-9_-]+(?:\.(?:jpe?g|png|webp))?(?::[A-Za-z0-9_]+)?$/u.test(url.pathname)) return "";
+    // X serves original post photos through name=orig (or the legacy .jpg:orig form).
+    if (/:[A-Za-z0-9_]+$/u.test(url.pathname)) {
+      url.pathname = url.pathname.replace(/:[A-Za-z0-9_]+$/u, ":orig");
+      url.searchParams.delete("name");
+    } else {
+      url.searchParams.set("name", "orig");
+    }
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function normalizeMediaVariants(value = {}) {
+  const seen = new Set();
+  const variants = [...(Array.isArray(value.variants) ? value.variants : []), {
+    url: value.url,
+    sourceKind: value.sourceKind,
+    width: value.width,
+    height: value.height,
+    declaredWidth: value.declaredWidth,
+    density: value.density
+  }].flatMap((variant, index) => {
+    const url = safeUrl(variant?.url);
+    if (!url) return [];
+    seen.add(url);
+    return [{
+      url,
+      sourceKind: normalizeMediaSourceKind(variant?.sourceKind),
+      width: positiveInteger(variant?.width, 0),
+      height: positiveInteger(variant?.height, 0),
+      declaredWidth: positiveInteger(variant?.declaredWidth, 0),
+      density: positiveNumber(variant?.density, 0),
+      order: index
+    }];
+  });
+  if ((!value.kind || value.kind === "image") && !value.localAssetId && !value.localTransferId) {
+    for (const variant of [...variants]) {
+      const original = xOriginalImageUrl(variant.url);
+      if (!original) continue;
+      if (original === variant.url) variant.sourceKind = "site-original";
+      else {
+        if (variant.sourceKind === "site-original") variant.sourceKind = "current";
+        if (!seen.has(original)) {
+          seen.add(original);
+          variants.push({ url: original, sourceKind: "site-original", width: 0, height: 0,
+            declaredWidth: 0, density: 0, order: variants.length });
+        }
+      }
+    }
+  }
+  const specificUrls = new Set(variants.filter(variant => variant.sourceKind !== "source").map(variant => variant.url));
+  const uniqueUrls = new Set();
+  return variants.filter(variant => variant.sourceKind !== "source" || !specificUrls.has(variant.url))
+    .sort((left, right) => mediaVariantScore(right) - mediaVariantScore(left) || left.order - right.order)
+    .filter(variant => {
+      if (uniqueUrls.has(variant.url)) return false;
+      uniqueUrls.add(variant.url);
+      return true;
+    })
+    .map(({ order, ...variant }) => variant);
+}
+
+function normalizeMediaSourceKind(value) {
+  const sourceKind = clean(value);
+  return ["site-original", "video-element", "structured", "picture-srcset", "deferred-srcset", "deferred-src", "img-srcset", "css-background", "current", "source"].includes(sourceKind)
+    ? sourceKind
+    : "source";
+}
+
+function mediaVariantScore(value) {
+  const sourcePriority = {
+    "site-original": 1000000,
+    structured: 550000,
+    "picture-srcset": 500000,
+    "deferred-srcset": 450000,
+    "deferred-src": 400000,
+    "img-srcset": 350000,
+    "css-background": 250000,
+    current: 200000,
+    source: 100000
+  }[value?.sourceKind] || 0;
+  const width = positiveInteger(value?.width || value?.declaredWidth, 0);
+  return sourcePriority + Math.min(width, 99999) + Math.min(99, positiveNumber(value?.density, 0) * 10);
+}
+
+function safeImageDataUrl(value) {
+  const dataUrl = String(value ?? "");
+  return /^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/=]+$/iu.test(dataUrl) ? dataUrl : "";
+}
+
+function stableCandidateId(url, title) {
+  let hash = 2166136261;
+  for (const character of `${url}\n${title}`) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  return `page:${(hash >>> 0).toString(36)}`;
+}
+
+function hostname(value) {
+  try { return new URL(value).hostname.replace(/^www\./, ""); } catch { return ""; }
+}
+
+function safeUrl(value) {
+  try {
+    const url = new URL(clean(value));
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+  } catch { return ""; }
+}
+
+function validIso(value) {
+  const text = clean(value);
+  return text && Number.isFinite(Date.parse(text)) ? new Date(text).toISOString() : "";
+}
+
+function positiveInteger(value, fallback = 0) {
+  const number = Math.trunc(Number(value));
+  return Number.isSafeInteger(number) && number > 0 ? number : fallback;
+}
+
+function positiveNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function normalizeText(value) {
+  return String(value ?? "").replace(/\r\n?/g, "\n").replace(/[\t ]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function clean(value) {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+}

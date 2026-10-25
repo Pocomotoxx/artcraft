@@ -20,6 +20,7 @@ import { useAutoGrowEditorHeight } from "./useAutoGrowEditorHeight";
 import { PromptFullscreenModal, useFullscreenPrompt } from "./PromptFullscreenModal";
 import { PromptFullscreenButton } from "./PromptFullscreenButton";
 import { PromptClearAllButton } from "./PromptClearAllButton";
+import { PromptDirectorButton } from "./PromptDirectorButton";
 import { gtagEvent } from "@storyteller/google-analytics";
 import { twMerge } from "tailwind-merge";
 import { GenerationProvider } from "@storyteller/api-enums";
@@ -574,6 +575,7 @@ export const PromptBoxImage = ({
                   setGenerationCount(count);
                 }}
               />
+              <PromptDirectorButton onPick={setPrompt} />
               <PromptClearAllButton
                 onClick={handleClearAll}
                 disabled={!hasClearableContent}

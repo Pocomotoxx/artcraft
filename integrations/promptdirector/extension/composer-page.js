@@ -1,0 +1,3882 @@
+import { createReferenceWindow } from './composer-reference-window.js';
+import { bindDiagnosticControls } from './diagnostic-controls.js';
+import { createMediaStage } from './staged-media.js';
+import { createLibraryViewReader } from './library-view-state.js';
+import { setTaskFeedbackState } from "./task-feedback.js";
+import { getLibraryStorage } from './library-storage.js';
+import { createSourceVideoPreview, bindSourceVideoCover } from "./source-video-preview.js";
+import { installWorkspaceReader, withWorkspaceMedia } from "./workspace-context.js";
+import { bindVideoHoverPreview } from "./video-hover-preview.js";
+import { sendWithGenerationPromptConfirmation } from "./image-generation-confirmation.js";
+import { showSkillCoverImage, clearSkillCoverImage } from "./skill-cover-ui.js";
+import { readSkillCover } from "./skill-cover.js";
+import { createToolDraftCard } from './composer-tool-draft-ui.js';
+import {
+  appendComposerMessage,
+  appendDiagnosticEvent,
+  clearComposerFailure,
+  composerInputUsage,
+  composerProfileForTaskAssignment,
+  completeComposerAssemblySnapshot,
+  createComposerAssemblySnapshot,
+  createComposerSession,
+  createReferenceSnapshots,
+  referenceSourcePartsForAsset,
+  isMeaningfulComposerSession,
+  isComposerEligibleEntry,
+  failComposerAssemblySnapshot,
+  normalizeComposerAiProfile,
+  plannerRequestPayload,
+  setComposerFailure,
+  normalizeComposerSettings
+} from "./composer.js";
+import {
+  buildComposerDiagnostic,
+  composerOutputChecks,
+  diagnosticFilename
+} from "./composer-diagnostics.js";
+import {
+  createAppliedSkillSnapshot,
+  findCreativeSkillsBySlashQuery,
+  normalizeCreativeSkillsState,
+  reorderAppliedSkills
+} from "./creative-skills.js";
+import {
+  normalizeAiSettings
+} from "./deepseek.js";
+import { requireAiRuntimeProtocolVersion } from "./ai-runtime.js";
+import { availableAiModelChoicesForTask } from "./ai-provider-registry.js";
+import { confirmAppAction } from "./ui-dialogs.js";
+import {
+  ComposerServiceError,
+  composerGenerationRequiresPromptAssembly,
+  composerImageEditCapabilities,
+  composerImageAvailability,
+  composerServiceCapabilities,
+  composerServiceCatalog,
+  composerLibraryToolService,
+  composerServiceErrorDetails,
+  composerVideoAvailability,
+  executeComposerTurnWithService,
+  normalizeImageGenerationRequest,
+  normalizeVideoGenerationRequest,
+  selectedComposerService
+} from "./composer-service.js";
+import { applyComposerServiceResult, planComposerSession, prepareComposerTurnStart } from "./composer-turn-core.js";
+import { sessionHasVideoReferences } from "./composer-video-references.js";
+import { createComposerImageWorkspace } from "./composer-image-workspace.js";
+import { composerAssemblyLayers, agentInstructionFor } from "./composer-agent.js";
+import {
+  createComposerActiveTurn,
+  createLatestCheckpointWriter,
+  recoverInterruptedComposerTurn,
+  updateComposerActiveTurn
+} from "./composer-active-turn.js";
+import { resolveComposerTurnPolicy } from "./composer-turn-policy.js";
+import { applyLibraryToolEvent, settleLibraryToolEvents } from "./composer-library-tools.js";
+import { createLocalComposerLibraryTools } from "./composer-library-host.js";
+import { deleteScreenshotBlob, getScreenshotBlob, saveScreenshotBlob } from "./image-store.js";
+import { readImageDimensions } from "./image-metadata.js";
+import { getAllDerivedMetadata, getDerivedMedia, getMediaBlob, saveDerivedMedia, saveMediaBlob } from "./media-store.js";
+import { prepareLocalMedia } from "./local-media.js";
+import { readVideoMedia } from "./browser-video-media.js";
+import { extractPdfSearchText } from "./document-viewer.js";
+import {
+  composerPasteFiles,
+  createTempReference,
+  namePastedTempReferenceFile,
+  TEMP_REFERENCE_FILE_ACCEPT,
+  TEMP_REFERENCE_SOURCE_TYPES,
+  tempReferenceAssetIds,
+  validateTempReferenceFile
+} from "./temp-references.js";
+import { primaryVisual, primaryVisionDescription } from "./visuals.js";
+import { entryMediaAssets, normalizeEntryMedia, posterAssetForVideo, primaryMediaAsset } from "./media.js";
+import { buildSearchIndex } from "./search-index.js";
+import { materializeLogicalCases, normalizeCompoundCases } from "./compound-cases.js";
+import { bindTransientMenus } from "./transient-menu.js";
+import { renderMarkdownDocument } from "./markdown-renderer.js";
+import { assertImageDimensions } from "./resource-limits.js";
+import { blobToDataUrl, normalizeVisionSettings } from "./vision.js";
+import { CONTENT_ROLES, contentRoleForEntry } from "./taxonomy.js";
+import { collectionEntryIds, collectionSelectorLabelsById } from "./organizer.js";
+import { createUiIcon, setUiIcon } from "./ui-icons.js";
+import {
+  bindUiPreferenceReload,
+  currentLocale,
+  initializeUi,
+  t,
+  translateUiMessage
+} from "./i18n.js";
+
+const uiPreferences = await initializeUi();
+bindUiPreferenceReload();
+bindTransientMenus(document, ".composer-options, .composer-toolbar-menu");
+
+const elements = Object.fromEntries([
+  "composer-shell", "composer-nav", "composer-nav-open", "composer-nav-close", "composer-new", "composer-session-list",
+  "composer-direction", "composer-direction-trigger", "composer-direction-icon", "composer-reference-inputs-trigger",
+  "composer-reference-inputs", "composer-send-images-field", "composer-send-videos-field", "composer-send-images", "composer-send-videos",
+  "composer-title", "composer-save-state", "composer-production-review", "composer-reference-open", "composer-reference-count",
+  "composer-applied-skills", "composer-skill-menu", "composer-assembly-open", "composer-timeline", "composer-aliases", "composer-instruction", "composer-action", "composer-feedback", "composer-send-note",
+  "composer-attachment-files", "composer-attachment-local", "composer-library-search", "composer-temp-reference-row", "composer-temp-references", "composer-temp-reference-save-all",
+  "composer-model-trigger", "composer-model-label", "composer-model-menu", "composer-model-dynamic", "composer-model-flash", "composer-model-pro", "composer-model-openai", "composer-model-openai-label", "composer-model-compatible", "composer-model-compatible-label", "composer-model-xai", "composer-model-xai-label", "composer-thinking", "composer-create-image", "composer-create-media-label", "composer-create-image-note", "composer-generation-settings", "composer-generation-settings-title", "composer-image-size-field", "composer-image-size", "composer-image-quality-field", "composer-image-quality", "composer-image-reference-mode-field", "composer-image-reference-mode", "composer-video-duration-field", "composer-video-duration", "composer-generation-parameter-note",
+  "composer-diagnostic-export", "composer-reference-workspace", "composer-reference-close", "composer-reference-cancel", "composer-reference-tab-cases", "composer-reference-tab-skills", "composer-project-list", "composer-projects-panel", "composer-case-picker", "composer-reference-footer", "composer-workspace-title", "composer-workspace-description",
+  "composer-case-selection-count", "composer-reference-search", "composer-reference-project-filter", "composer-case-list", "composer-selection-strip",
+  "composer-reference-clear", "composer-reference-apply", "composer-reference-feedback", "composer-assembly-dialog", "composer-assembly-close", "composer-assembly-content",
+].map((id) => [camel(id), document.querySelector(`#${id}`)]));
+
+bindDiagnosticControls({
+  controls: [elements.composerDiagnosticExport, elements.composerAssemblyOpen], preferences: uiPreferences,
+  onDisable: () => { if (elements.composerAssemblyDialog.open) elements.composerAssemblyDialog.close(); }
+});
+
+let entries = [];
+let physicalEntries = [];
+let compoundCases = [];
+let organizerState = { collections: [] };
+let creativeSkills = normalizeCreativeSkillsState();
+let facetCatalog = { facets: [], nodes: [] };
+let composerSettings = normalizeComposerSettings();
+let composerAiSettings = normalizeAiSettings();
+let composerVisionSettings = normalizeVisionSettings();
+let composerAiTaskAssignments = {};
+let composerAiRuntimeProtocolVersion = null;
+let sessionSummaries = [];
+let creativeRuns = [];
+let creativeJobs = { version: 1, items: [] };
+let lastCreativeJob = null;
+let creativeExperimentSettings = { enabled: false, autoAnalyze: false };
+let composerSearchIndex = [];
+let composerDocumentTextByEntryId = new Map();
+let libraryRetrievalEnabled = true;
+let creativeStateRefreshRevision = 0;
+let composerInitializationComplete = false;
+let creativeStateRefreshPending = false;
+let initialProjectFilterId = "";
+
+const imageWorkspace = createComposerImageWorkspace({
+  translate: t,
+  loadBlob: getScreenshotBlob,
+  onSave: (item) => saveCreativeOutput(item.run.id, item.output.visual.id),
+  onUseAsReference: (item) => useCreativeOutputAsReference(item.run, item.output),
+  onReroll: (item) => rerollCreativeOutput(item.run, item.output),
+  onEdit: (request) => editCreativeOutput(request.item.run, request.item.output, request),
+  onDelete: (item) => deleteCreativeOutput(item.run.id, item.output.visual.id)
+});
+let composerSession = null;
+let activeOperation = null;
+let referenceDraftSelections = new Map();
+let referenceDraftOrder = [];
+let referenceDraftSourceSelections = new Map();
+let referencePreviewAssetIds = new Map();
+let referenceFocusedEntryId = "";
+let workspaceMode = "references";
+let feedbackTimer = 0;
+const COMPOSER_TITLE_MAX_CHARACTERS = 36;
+const thumbnailUrls = new Map();
+const openJudgmentIds = new Set();
+const judgmentFeedbackById = new Map();
+const judgmentRequestById = new Map();
+const imageObserver = new IntersectionObserver((items) => {
+  for (const item of items) {
+    if (!item.isIntersecting) continue;
+    imageObserver.unobserve(item.target);
+    hydrateCaseImage(item.target);
+  }
+}, { rootMargin: "240px" });
+const referenceCaseWindow = createReferenceWindow(elements.composerCaseList, {
+  createCard: createCaseOption,
+  releaseCard: releaseReferenceCard
+});
+function releaseReferenceCard(card) {
+  const images = [...card.querySelectorAll('img')];
+  for (const image of images) imageObserver.unobserve(image);
+  const retained = new Set([...document.querySelectorAll('img')].filter(image => !card.contains(image)).map(image => image.src));
+  for (const image of images) {
+    const key = image.dataset.thumbnailKey || image.dataset.visualId;
+    const url = thumbnailUrls.get(key);
+    if (!url || retained.has(url)) continue;
+    URL.revokeObjectURL(url);
+    thumbnailUrls.delete(key);
+  }
+  for (const surface of card.querySelectorAll('.composer-case-select-preview')) {
+    surface.releaseVideo?.();
+  }
+}
+
+
+bindEvents();
+void installWorkspaceReader({ chromeApi: chrome, readContext: () => {
+  if (!composerInitializationComplete || !composerSession) throw new Error("创作台尚未就绪，请稍后重读。");
+  return { surface: "composer", sessionId: composerSession.id,
+    instruction: elements.composerInstruction.value,
+    pendingReferenceSelection: !elements.composerReferenceWorkspace.hidden && workspaceMode === "references",
+    references: withWorkspaceMedia(composerSession.referenceSnapshots, entries) };
+} });
+try {
+  await initializeComposer();
+  composerInitializationComplete = true;
+  if (creativeStateRefreshPending) {
+    creativeStateRefreshPending = false;
+    await refreshCreativeResultState();
+  }
+  renderSendState();
+} catch (error) {
+  composerInitializationComplete = true;
+  composerFeedback(error.message || t("无法读取创作资料"), true);
+}
+
+function bindEvents() {
+  elements.composerAttachmentFiles.accept = TEMP_REFERENCE_FILE_ACCEPT;
+  elements.composerNew.addEventListener("click", safely(() => createNewSession()));
+  elements.composerAction.addEventListener("click", safely(handleComposerAction));
+  elements.composerModelTrigger.addEventListener("click", toggleComposerModelMenu);
+  elements.composerModelFlash.addEventListener("click", safely(() => updateComposerAiProfile({ serviceId: "deepseek", model: "deepseek-flash" })));
+  elements.composerModelPro.addEventListener("click", safely(() => updateComposerAiProfile({ serviceId: "deepseek", model: "deepseek-v4-pro" })));
+  elements.composerModelOpenai.addEventListener("click", safely(() => updateComposerAiProfile({ serviceId: "openai", model: composerVisionSettings.openai.model, thinking: false })));
+  elements.composerModelCompatible.addEventListener("click", safely(() => updateComposerAiProfile({ serviceId: "compatible", model: composerVisionSettings.compatible.model, thinking: false })));
+  elements.composerModelXai.addEventListener("click", safely(() => updateComposerAiProfile({ serviceId: "xai", model: composerVisionSettings.xai?.textModel, thinking: false })));
+  elements.composerThinking.addEventListener("change", safely(() => updateComposerAiProfile({ thinking: elements.composerThinking.checked })));
+  elements.composerCreateImage.addEventListener("change", safely(updateComposerOutputMode));
+  elements.composerImageSize.addEventListener("change", safely(updateImageGenerationParameters));
+  elements.composerImageQuality.addEventListener("change", safely(updateImageGenerationParameters));
+  elements.composerSendImages.addEventListener("change", safely(updateReferenceInputs));
+  elements.composerSendVideos.addEventListener("change", safely(updateReferenceInputs));
+  elements.composerImageReferenceMode.addEventListener("change", safely(updateImageReferenceMode));
+  elements.composerVideoDuration.addEventListener("change", safely(updateImageGenerationParameters));
+  elements.composerDiagnosticExport.addEventListener("click", safely(exportComposerDiagnostic));
+  elements.composerAttachmentLocal.addEventListener("click", () => elements.composerAttachmentFiles.click());
+  elements.composerLibrarySearch.addEventListener("click", safely(toggleLibraryRetrieval));
+  elements.composerAttachmentFiles.addEventListener("change", safely(async () => {
+    const files = Array.from(elements.composerAttachmentFiles.files ?? []);
+    elements.composerAttachmentFiles.value = "";
+    await addTempReferences(files);
+  }));
+  elements.composerTempReferenceSaveAll.addEventListener("click", safely(saveAllTempReferences));
+  elements.composerInstruction.addEventListener("input", () => {
+    resizeComposerInput();
+    renderSlashSkillMenu();
+    renderSendState();
+  });
+  elements.composerInstruction.addEventListener("keydown", (event) => {
+    if (!elements.composerSkillMenu.hidden && ["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(event.key)) {
+      if (handleSkillMenuKey(event)) return;
+    }
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    safely(handleComposerAction)();
+  });
+  elements.composerInstruction.addEventListener("paste", (event) => {
+    const files = composerPasteFiles(event.clipboardData);
+    if (!files.length) return;
+    event.preventDefault();
+    const normalized = files.map((file) => namePastedTempReferenceFile(file, `pasted-${crypto.randomUUID()}`));
+    safely(() => addTempReferences(normalized))();
+  });
+  const inputBox = elements.composerInstruction.closest(".composer-input-box");
+  inputBox.addEventListener("dragover", (event) => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+    event.preventDefault();
+    inputBox.classList.add("drag-active");
+  });
+  inputBox.addEventListener("dragleave", () => inputBox.classList.remove("drag-active"));
+  inputBox.addEventListener("drop", (event) => {
+    inputBox.classList.remove("drag-active");
+    const files = composerPasteFiles(event.dataTransfer);
+    if (!files.length) return;
+    event.preventDefault();
+    safely(() => addTempReferences(files))();
+  });
+  elements.composerProductionReview.addEventListener("change", safely(updateComposerPreferences));
+  document.querySelectorAll('input[name="composer-type"]').forEach((input) => input.addEventListener("change", safely(async () => {
+    await updateComposerPreferences();
+    elements.composerDirection.open = false;
+    elements.composerDirectionTrigger.focus();
+  })));
+  document.querySelectorAll(".composer-toolbar-menu").forEach((menu) => {
+    menu.querySelector("summary").addEventListener("click", () => {
+      if (!menu.open) positionComposerInputMenu(menu);
+    });
+  });
+  document.querySelectorAll(".composer-toolbar-menu").forEach((menu) => menu.addEventListener("toggle", () => {
+    if (menu.open) {
+      closeComposerModelMenu();
+      positionComposerInputMenu(menu);
+    }
+  }));
+  window.addEventListener("resize", () => {
+    document.querySelectorAll(".composer-toolbar-menu[open]").forEach(positionComposerInputMenu);
+  });
+  elements.composerReferenceOpen.addEventListener("click", openReferenceWorkspace);
+  elements.composerReferenceTabCases.addEventListener("click", () => setReferenceWorkspaceMode("references"));
+  elements.composerReferenceTabSkills.addEventListener("click", () => setReferenceWorkspaceMode("skills"));
+  elements.composerAssemblyOpen.addEventListener("click", openAssemblyDialog);
+  elements.composerAssemblyClose.addEventListener("click", () => elements.composerAssemblyDialog.close());
+  elements.composerReferenceClose.addEventListener("click", closeReferenceWorkspace);
+  elements.composerReferenceCancel.addEventListener("click", closeReferenceWorkspace);
+  elements.composerReferenceSearch.addEventListener("input", () => { referenceFocusedEntryId = ""; renderCasePicker(); });
+  document.addEventListener("visibilitychange", () => {
+    document.body.classList.toggle("composer-page-paused", document.hidden);
+  });
+  elements.composerReferenceProjectFilter.addEventListener("change", () => { referenceFocusedEntryId = ""; renderCasePicker(); });
+  elements.composerReferenceClear.addEventListener("click", () => {
+    referenceDraftSelections.clear();
+    referenceDraftOrder = [];
+    syncRenderedReferenceCards();
+    renderReferenceSelection();
+  });
+  elements.composerReferenceApply.addEventListener("click", safely(applySelectedReferences));
+  elements.composerNavOpen.addEventListener("click", () => elements.composerShell.classList.add("nav-open"));
+  elements.composerNavClose.addEventListener("click", () => elements.composerShell.classList.remove("nav-open"));
+  document.addEventListener("click", (event) => {
+    if (!elements.composerModelMenu.hidden && !event.target.closest(".composer-model-control")) closeComposerModelMenu();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeComposerModelMenu();
+  });
+  addEventListener("beforeunload", () => {
+    referenceCaseWindow.destroy();
+    for (const url of thumbnailUrls.values()) URL.revokeObjectURL(url);
+  });
+  getLibraryStorage().subscribe((changes) => {
+    const draft = changes.composerSessionDrafts?.newValue?.[composerSession?.id];
+    if (draft && !activeOperation && draft.chatRevision > (composerSession.chatRevision || 0)
+      && elements.composerInstruction.value === (composerSession.currentInstruction || '')) {
+      composerSession = { ...composerSession, ...draft };
+      elements.composerInstruction.value = draft.currentInstruction;
+      resizeComposerInput(); renderSendState();
+    }
+    if (changes.aiProviderRegistry || changes.aiTaskAssignments || changes.aiPreferences) safely(refreshComposerServiceSettings)();
+    if (changes.creativeRuns || changes.creativeJobs || changes.composerSessions || changes.entries || changes.compoundCases || changes.creativeExperimentSettings || changes.creativeSkills) {
+      if (!composerInitializationComplete) creativeStateRefreshPending = true;
+      else safely(refreshCreativeResultState)();
+    }
+  });
+}
+
+async function refreshCreativeResultState() {
+  const revision = ++creativeStateRefreshRevision;
+  const response = await readWorkspaceLibraryState();
+  if (!response?.ok || revision !== creativeStateRefreshRevision) return;
+  const nextPhysicalEntries = response.entries ?? physicalEntries;
+  const nextCompoundCases = normalizeCompoundCases(response.compoundCases ?? compoundCases, nextPhysicalEntries);
+  const nextEntries = materializeLogicalCases(nextPhysicalEntries, nextCompoundCases);
+  sessionSummaries = response.composerSessionSummaries ?? sessionSummaries;
+  creativeRuns = response.creativeRuns ?? creativeRuns;
+  creativeJobs = response.creativeJobs ?? creativeJobs;
+  creativeExperimentSettings = response.creativeExperimentSettings ?? creativeExperimentSettings;
+  creativeSkills = normalizeCreativeSkillsState(response.creativeSkills);
+  if (!await syncCreativeJobState(revision)) return;
+  if (composerSession?.assistantState && !activeOperation) {
+    const sessionId = composerSession.id;
+    const shared = await chrome.runtime.sendMessage({ type: "GET_COMPOSER_SESSION", sessionId });
+    if (revision !== creativeStateRefreshRevision) return;
+    if (shared?.ok && composerSession?.id === sessionId && shared.session.chatRevision > composerSession.chatRevision) {
+      composerSession = shared.session;
+    }
+  }
+  renderActiveState();
+  renderSlashSkillMenu();
+
+  const searchState = await createComposerSearchState(nextEntries);
+  if (revision !== creativeStateRefreshRevision) return;
+  physicalEntries = nextPhysicalEntries;
+  compoundCases = nextCompoundCases;
+  entries = nextEntries;
+  composerDocumentTextByEntryId = searchState.documentTextByEntryId;
+  composerSearchIndex = searchState.searchIndex;
+}
+
+async function syncCreativeJobState(expectedRevision = null) {
+  const current = () => expectedRevision === null || expectedRevision === creativeStateRefreshRevision;
+  const items = Array.isArray(creativeJobs?.items) ? creativeJobs.items : [];
+  const active = items.find((item) => ["queued", "running"].includes(item.status)) ?? null;
+  lastCreativeJob = composerSession
+    ? [...items].reverse().find((item) => item.sessionId === composerSession.id) ?? null
+    : items.at(-1) ?? null;
+  if (active) {
+    if (!composerSession || composerSession.id === active.sessionId) {
+      const response = await chrome.runtime.sendMessage({ type: "GET_COMPOSER_SESSION", sessionId: active.sessionId });
+      if (!current()) return false;
+      if (!composerSession || composerSession.id === active.sessionId) {
+        composerSession = response?.ok ? response.session : active.request.session;
+      }
+    }
+    activeOperation = {
+      kind: "compose",
+      durable: true,
+      jobId: active.id,
+      sessionId: active.sessionId,
+      phase: active.executionState === "stop_requested" ? "stopping" : active.phase === "planning" ? "planning" : "streaming",
+      requestPhase: active.phase,
+      executionRoute: active.request.session.currentRoute || "compose",
+      userMessageId: active.userMessageId,
+      session: composerSession?.id === active.sessionId ? composerSession : active.request.session,
+      streamingText: composerSession?.id === active.sessionId ? composerSession.activeTurn?.partialText || "" : ""
+    };
+    return true;
+  }
+  if (activeOperation?.durable) activeOperation = null;
+  if (!lastCreativeJob || lastCreativeJob.sessionId !== composerSession?.id) return current();
+  const response = await chrome.runtime.sendMessage({ type: "GET_COMPOSER_SESSION", sessionId: composerSession.id });
+  if (!current()) return false;
+  if (response?.ok) composerSession = response.session;
+  if (["failed", "canceled", "interrupted"].includes(lastCreativeJob.status) && lastCreativeJob.error?.message) {
+    composerFeedback(lastCreativeJob.error.message, true);
+  }
+  return true;
+}
+
+async function initializeComposer() {
+  const response = await readWorkspaceLibraryState();
+  if (!response?.ok) throw new Error(response?.message || "无法读取创作资料");
+  ({ ai: composerAiSettings, vision: composerVisionSettings } = await privateComposerServiceSettings());
+  physicalEntries = response.entries ?? [];
+  compoundCases = normalizeCompoundCases(response.compoundCases, physicalEntries);
+  entries = materializeLogicalCases(physicalEntries, compoundCases);
+  organizerState = response.organizerState ?? { collections: [] };
+  facetCatalog = response.facetCatalog ?? facetCatalog;
+  await rebuildComposerSearchIndex();
+  composerSettings = normalizeComposerSettings(response.composerSettings);
+  sessionSummaries = response.composerSessionSummaries ?? [];
+  creativeRuns = Array.isArray(response.creativeRuns) ? response.creativeRuns : [];
+  creativeJobs = response.creativeJobs ?? creativeJobs;
+  creativeExperimentSettings = response.creativeExperimentSettings ?? creativeExperimentSettings;
+  creativeSkills = normalizeCreativeSkillsState(response.creativeSkills);
+
+  const params = new URLSearchParams(location.search);
+  const requestedProjectId = params.get("project");
+  if ((organizerState.collections ?? []).some((item) => item.id === requestedProjectId)) {
+    initialProjectFilterId = requestedProjectId;
+  }
+  const sessionId = params.get("session");
+  const requestedSkillId = params.get("skill");
+  const requestedType = ["image", "video"].includes(params.get("type")) ? params.get("type") : "";
+  if (!sessionId && requestedType) {
+    document.querySelectorAll('input[name="composer-type"]').forEach((input) => { input.checked = input.value === requestedType; });
+  }
+  if (sessionId) {
+    const existing = await chrome.runtime.sendMessage({ type: "GET_COMPOSER_SESSION", sessionId });
+    if (existing?.ok) composerSession = existing.session;
+  }
+  await syncCreativeJobState();
+  if (composerSession && !activeOperation) {
+    const recovered = recoverInterruptedComposerTurn(composerSession);
+    if (recovered !== composerSession) {
+      composerSession = createComposerSession(recovered);
+      composerSession = await saveSession(composerSession).catch(() => composerSession);
+    }
+    if (composerSession.assistantState) elements.composerInstruction.value = composerSession.currentInstruction || '';
+  }
+  if (!composerSession) {
+    const requestedIds = uniqueIds((params.get("references") ?? "").split(","));
+    const requestedAssetId = String(params.get("asset") ?? "").trim();
+    const requestedSelections = requestedAssetId && requestedIds.length === 1
+      ? [{ entryId: requestedIds[0], assetIds: [requestedAssetId] }]
+      : requestedIds.map((entryId) => {
+          const entry = entries.find((item) => item.id === entryId);
+          const assets = selectableReferenceAssets(entry, requestedType);
+          const primary = assets.find((asset) => asset.id === entry?.primaryMediaId) ?? assets[0];
+          return { entryId, assetIds: primary ? [primary.id] : [] };
+        });
+    await createNewSession(requestedSelections, false);
+  } else renderComposer();
+  if (!sessionId && requestedSkillId) {
+    const requestedSkill = creativeSkills.items.find((item) => item.id === requestedSkillId);
+    if (requestedSkill) await applyCreativeSkill(requestedSkill);
+    else composerFeedback("没有找到这份创作 Skill", true);
+  }
+  renderSlashSkillMenu();
+}
+
+async function createNewSession(referenceIds = [], focus = true) {
+  const targetType = selectedTargetType();
+  composerSession = createComposerSession({
+    title: targetType === "video" ? t("未命名视频提示词") : t("未命名图片提示词"),
+    targetType,
+    targetPlatform: "",
+    outputLanguage: "auto",
+    routeMode: "auto",
+    imageReferenceMode: "text_only",
+    videoReferenceMode: "text_only",
+    aiProfile: composerProfileForTaskAssignment(composerAiTaskAssignments.creativePlanning, composerSettings.lastAiProfile),
+    generationAiProfile: composerProfileForTaskAssignment(
+      composerAiTaskAssignments[targetType === "video" ? "videoGeneration" : "imageGeneration"],
+      composerSettings.lastAiProfile
+    ),
+    productionReviewEnabled: composerSettings.productionReviewEnabled,
+    referenceSnapshots: createReferenceSnapshots(entries, referenceIds, currentLocale(), targetType, { documentTextByEntryId: composerDocumentTextByEntryId })
+  });
+  if (isMeaningfulComposerSession(composerSession)) {
+    composerSession = await saveSession(composerSession);
+    replaceComposerSessionUrl(composerSession.id);
+  } else history.replaceState(null, "", "composer.html");
+  renderComposer();
+  if (focus) elements.composerInstruction.focus();
+}
+
+function renderComposer() {
+  if (!composerSession) return;
+  libraryRetrievalEnabled = composerSession.libraryRetrievalEnabled !== false;
+  document.querySelectorAll('input[name="composer-type"]').forEach((input) => {
+    input.checked = input.value === composerSession.targetType;
+  });
+  elements.composerTitle.textContent = composerSession.title;
+  elements.composerProductionReview.checked = composerSession.productionReviewEnabled;
+  elements.composerProductionReview.disabled = !["auto", "compose"].includes(composerSession.routeMode);
+  renderComposerAiProfile();
+  const libraryReferences = composerSession.referenceSnapshots.filter((reference) => reference.sourceType !== TEMP_REFERENCE_SOURCE_TYPES.temporary);
+  elements.composerReferenceCount.textContent = String(libraryReferences.length);
+  elements.composerAliases.replaceChildren(...libraryReferences.map(referenceAliasButton));
+  elements.composerAliases.hidden = libraryReferences.length === 0;
+  renderTempReferences();
+  renderLibraryRetrievalToggle();
+  renderAppliedSkills();
+  renderSessions();
+  renderTimeline();
+  renderSendState();
+  renderComposerSaveState();
+  resizeComposerInput();
+}
+
+function renderTempReferences() {
+  const references = (composerSession?.referenceSnapshots ?? [])
+    .filter((reference) => reference.sourceType === TEMP_REFERENCE_SOURCE_TYPES.temporary);
+  elements.composerTempReferenceRow.hidden = references.length === 0;
+  elements.composerTempReferenceSaveAll.disabled = Boolean(activeOperation) || references.length === 0;
+  elements.composerTempReferences.replaceChildren(...references.map(tempReferenceCard));
+}
+
+async function toggleLibraryRetrieval() {
+  if (activeOperation || !composerSession) return;
+  composerSession = await saveSession(createComposerSession({
+    ...composerSession, libraryRetrievalEnabled: !libraryRetrievalEnabled
+  }));
+  renderComposer();
+}
+
+function renderLibraryRetrievalToggle() {
+  elements.composerLibrarySearch.setAttribute("aria-pressed", String(libraryRetrievalEnabled));
+  elements.composerLibrarySearch.classList.toggle("selected", libraryRetrievalEnabled);
+  const service = composerLibraryToolService(composerSession, composerAiSettings, composerVisionSettings);
+  const label = t(libraryRetrievalEnabled ? (service.nativeTools ? "案例库：按需；仅在你要求查询或参考时使用，点击关闭" : "当前模型未声明工具能力，可通过选择案例手动查询；点击关闭案例库") : "案例库：关闭，点击开启");
+  elements.composerLibrarySearch.title = label;
+  elements.composerLibrarySearch.setAttribute("aria-label", label);
+}
+
+function tempReferenceCard(reference) {
+  const asset = reference.assetRefs[0];
+  const card = el("article", "composer-temp-reference-card");
+  const insert = el("button", "composer-temp-reference-main");
+  insert.type = "button";
+  insert.title = `${reference.alias} ${reference.title}`;
+  insert.addEventListener("click", () => insertComposerAlias(reference.alias));
+  const preview = el("span", "composer-temp-reference-preview");
+  if (asset?.kind === "image") {
+    const image = document.createElement("img");
+    image.alt = "";
+    preview.append(image);
+    safely(() => hydrateTempReferenceImage(image, asset.assetId))();
+  } else {
+    preview.append(rawTextEl("span", "", tempReferenceTypeLabel(asset)));
+  }
+  const copy = el("span", "composer-temp-reference-copy");
+  copy.append(rawTextEl("small", "", reference.alias), rawTextEl("strong", "", reference.title || t("未命名文件")));
+  insert.append(preview, copy);
+  const actions = el("span", "composer-temp-reference-actions");
+  const save = el("button", "icon-button");
+  save.type = "button";
+  save.disabled = Boolean(activeOperation);
+  save.title = t("保存到案例库");
+  save.setAttribute("aria-label", t("保存到案例库：{title}", { title: reference.title }));
+  save.append(createUiIcon("save"));
+  save.addEventListener("click", () => safely(() => saveTempReferenceAsCase(reference.entryId))());
+  const remove = el("button", "icon-button");
+  remove.type = "button";
+  remove.disabled = Boolean(activeOperation);
+  remove.title = t("移除临时附件");
+  remove.setAttribute("aria-label", t("移除临时附件：{title}", { title: reference.title }));
+  remove.append(createUiIcon("x"));
+  remove.addEventListener("click", () => safely(() => removeTempReference(reference.entryId))());
+  actions.append(save, remove);
+  card.append(insert, actions);
+  return card;
+}
+
+async function hydrateTempReferenceImage(image, assetId) {
+  const cached = thumbnailUrls.get(assetId);
+  if (cached) {
+    image.src = cached;
+    return;
+  }
+  const [blob, derived] = await Promise.all([getMediaBlob(assetId), getDerivedMedia(assetId)]);
+  if (!(blob instanceof Blob) || !image.isConnected) return;
+  const displayBlob = blob.type === "image/gif" && derived?.thumbnail instanceof Blob ? derived.thumbnail : blob;
+  const url = URL.createObjectURL(displayBlob);
+  thumbnailUrls.set(assetId, url);
+  image.src = url;
+}
+
+function tempReferenceTypeLabel(asset) {
+  const type = String(asset?.mimeType ?? "").toLocaleLowerCase("en-US");
+  if (type.startsWith("video/")) return "视频";
+  if (type === "application/pdf") return "PDF";
+  if (type === "text/markdown") return "MD";
+  if (type === "text/html") return "HTML";
+  return "TXT";
+}
+
+async function addTempReferences(filesValue) {
+  if (!composerSession) return;
+  if (activeOperation) throw new Error("生成期间不能添加临时附件");
+  const files = Array.from(filesValue ?? []);
+  if (!files.length) return;
+  files.forEach(validateTempReferenceFile);
+  const prepared = await Promise.all(files.map(async (file, index) => {
+    const referenceId = `temp-reference:${crypto.randomUUID()}`;
+    const assetId = `temp-reference-asset:${crypto.randomUUID()}`;
+    const aliasIndex = composerSession.referenceSnapshots.length + index + 1;
+    const alias = currentLocale() === "en" ? `@Reference${aliasIndex}` : `@参考${aliasIndex}`;
+    const preparedFile = await prepareLocalMedia(file, assetId, {
+      allowVideo: true,
+      readVideoMedia,
+      relativePath: file.name,
+      extractPdfText: extractPdfSearchText
+    });
+    return {
+      preparedFile,
+      reference: createTempReference({ file, assetId, referenceId, alias, extractedText: preparedFile.contentText })
+    };
+  }));
+  const stage = createMediaStage();
+  try {
+    for (const item of prepared) {
+      const [assetId] = tempReferenceAssetIds(item.reference);
+      await stage.register([assetId]);
+      await saveMediaBlob(assetId, item.preparedFile.blob);
+      const thumbnail = item.preparedFile.poster?.blob instanceof Blob ? item.preparedFile.poster.blob : undefined;
+      const searchText = String(item.preparedFile.contentText ?? "").trim();
+      if (thumbnail || searchText) {
+        await saveDerivedMedia(assetId, { ...(thumbnail ? { thumbnail } : {}), ...(searchText ? { searchText } : {}) });
+      }
+    }
+    const response = await chrome.runtime.sendMessage({
+      type: "ADD_TEMP_REFERENCES",
+      sessionId: composerSession.id,
+      session: composerSession,
+      tempReferences: prepared.map((item) => item.reference)
+    });
+    applyTempReferenceResponse(response, "无法添加临时附件");
+    replaceComposerSessionUrl(composerSession.id);
+    renderComposer();
+    composerFeedback(t("已添加 {count} 个临时附件", { count: prepared.length }));
+  } finally {
+    await stage.release();
+  }
+}
+
+async function removeTempReference(tempReferenceId) {
+  if (!composerSession || activeOperation) return;
+  const response = await chrome.runtime.sendMessage({
+    type: "REMOVE_TEMP_REFERENCE",
+    sessionId: composerSession.id,
+    tempReferenceId
+  });
+  applyTempReferenceResponse(response, "无法移除临时附件");
+  renderComposer();
+}
+
+async function saveTempReferenceAsCase(tempReferenceId) {
+  if (!composerSession || activeOperation) return;
+  const response = await chrome.runtime.sendMessage({
+    type: "SAVE_TEMP_REFERENCE_AS_CASE",
+    sessionId: composerSession.id,
+    tempReferenceId
+  });
+  applyTempReferenceResponse(response, "无法保存临时附件");
+  renderComposer();
+  composerFeedback(response.message || "已保存到案例库");
+}
+
+async function saveAllTempReferences() {
+  const references = (composerSession?.referenceSnapshots ?? [])
+    .filter((reference) => reference.sourceType === TEMP_REFERENCE_SOURCE_TYPES.temporary);
+  if (!references.length || activeOperation) return;
+  elements.composerTempReferenceSaveAll.disabled = true;
+  try {
+    for (const reference of references) await saveTempReferenceAsCase(reference.entryId);
+    composerFeedback(t("已保存 {count} 个附件到案例库", { count: references.length }));
+  } finally {
+    elements.composerTempReferenceSaveAll.disabled = false;
+  }
+}
+
+function applyTempReferenceResponse(response, fallbackMessage) {
+  if (!response?.ok || !response.session) throw new Error(response?.message || fallbackMessage);
+  composerSession = createComposerSession(response.session);
+  sessionSummaries = response.summaries ?? sessionSummaries;
+}
+
+function renderAppliedSkills() {
+  const skills = composerSession?.appliedSkills ?? [];
+  elements.composerAppliedSkills.hidden = skills.length === 0;
+  elements.composerAppliedSkills.replaceChildren(...skills.map((skill, index) => {
+    const chip = el("span", "composer-skill-chip");
+    chip.append(rawTextEl("strong", "", `/${skill.callName}`));
+    const up = rawTextEl("button", "", "↑");
+    up.type = "button";
+    up.title = t("提高 Skill 优先级");
+    up.disabled = index === 0;
+    up.addEventListener("click", () => safely(() => moveAppliedSkill(skill.skillId, -1))());
+    const down = rawTextEl("button", "", "↓");
+    down.type = "button";
+    down.title = t("降低 Skill 优先级");
+    down.disabled = index === skills.length - 1;
+    down.addEventListener("click", () => safely(() => moveAppliedSkill(skill.skillId, 1))());
+    const remove = rawTextEl("button", "", "×");
+    remove.type = "button";
+    remove.title = t("移除 /{callName}", { callName: skill.callName });
+    remove.addEventListener("click", () => safely(() => removeAppliedSkill(skill.skillId))());
+    chip.append(up, down, remove);
+    return chip;
+  }));
+}
+
+async function moveAppliedSkill(skillId, direction) {
+  if (!composerSession || activeOperation) return;
+  composerSession = createComposerSession({
+    ...composerSession,
+    appliedSkills: reorderAppliedSkills(composerSession.appliedSkills, skillId, direction),
+    currentInstruction: "",
+    retrievedSources: [],
+    currentRoute: "",
+    currentRouteSource: ""
+  });
+  composerSession = await saveSession(composerSession);
+  renderComposer();
+}
+
+function slashSkillQuery() {
+  const input = elements.composerInstruction;
+  const before = input.value.slice(0, input.selectionStart);
+  const match = before.match(/(?:^|\s)\/([^\s/]*)$/u);
+  return match ? { query: match[1], start: input.selectionStart - match[1].length - 1, end: input.selectionStart } : null;
+}
+
+function renderSlashSkillMenu() {
+  const query = slashSkillQuery();
+  if (!query) {
+    elements.composerSkillMenu.hidden = true;
+    return;
+  }
+  const applied = new Set(composerSession?.appliedSkills.map((item) => item.skillId) ?? []);
+  const matches = findCreativeSkillsBySlashQuery(creativeSkills, query.query).filter((skill) => !applied.has(skill.id)).slice(0, 8);
+  if (!matches.length) {
+    elements.composerSkillMenu.hidden = true;
+    return;
+  }
+  elements.composerSkillMenu.replaceChildren(...matches.map((skill, index) => {
+    const button = el("button");
+    button.type = "button";
+    button.role = "option";
+    button.dataset.skillId = skill.id;
+    button.setAttribute("aria-selected", String(index === 0));
+    const copy = el("span");
+    copy.append(rawTextEl("strong", "", `/${skill.callName}`), rawTextEl("small", "", skill.description || t("创作 Skill")));
+    button.append(copy, rawTextEl("small", "", `v${skill.versions.findIndex((item) => item.id === skill.currentVersionId) + 1}`));
+    button.addEventListener("mousedown", (event) => event.preventDefault());
+    button.addEventListener("click", () => safely(() => selectSlashSkill(skill))());
+    return button;
+  }));
+  elements.composerSkillMenu.hidden = false;
+}
+
+function handleSkillMenuKey(event) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    elements.composerSkillMenu.hidden = true;
+    return true;
+  }
+  const options = [...elements.composerSkillMenu.querySelectorAll("button")];
+  if (!options.length) return false;
+  const current = Math.max(0, options.findIndex((item) => item.getAttribute("aria-selected") === "true"));
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const next = (current + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+    options.forEach((item, index) => item.setAttribute("aria-selected", String(index === next)));
+    options[next].scrollIntoView({ block: "nearest" });
+    return true;
+  }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    const skill = creativeSkills.items.find((item) => item.id === options[current].dataset.skillId);
+    if (skill) safely(() => selectSlashSkill(skill))();
+    return true;
+  }
+  return false;
+}
+
+async function selectSlashSkill(skill) {
+  const query = slashSkillQuery();
+  if (query) {
+    const input = elements.composerInstruction;
+    input.value = `${input.value.slice(0, query.start)}${input.value.slice(query.end)}`.replace(/\s{2,}/g, " ");
+    input.setSelectionRange(query.start, query.start);
+  }
+  elements.composerSkillMenu.hidden = true;
+  await applyCreativeSkill(skill);
+  elements.composerInstruction.focus();
+}
+
+function renderSessions() {
+  const summaries = new Map(sessionSummaries.map((summary) => [summary.id, summary]));
+  const current = sessionSummaryFromCurrent();
+  if (current) summaries.set(current.id, current);
+  const ordered = [...summaries.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const groups = [
+    { id: "today", label: "今天", items: [] },
+    { id: "yesterday", label: "昨天", items: [] },
+    { id: "recent", label: "近 7 天", items: [] },
+    { id: "older", label: "更早", items: [] }
+  ];
+  const byId = new Map(groups.map((group) => [group.id, group]));
+  for (const summary of ordered) byId.get(sessionDateGroup(summary.updatedAt)).items.push(summary);
+  elements.composerSessionList.replaceChildren(...groups.filter((group) => group.items.length).map((group) => {
+    const section = el("section", "composer-session-group");
+    section.dataset.sessionGroup = group.id;
+    section.append(rawTextEl("h3", "composer-session-group-label", t(group.label)));
+    const list = el("div", "composer-session-group-list");
+    list.append(...group.items.map(summary => renderSessionRow(summary)));
+    section.append(list);
+    return section;
+  }));
+}
+
+function renderSessionRow(summary) {
+    const row = el("div", "composer-session-item");
+    row.dataset.sessionId = summary.id;
+    row.setAttribute("aria-current", String(summary.id === composerSession?.id));
+    const load = document.createElement("button");
+    load.type = "button";
+    load.className = "ui-content-row";
+    const running = activeOperation?.kind === "compose" && activeOperation.sessionId === summary.id;
+    load.append(rawTextEl("strong", "", summary.title));
+    if (running) load.append(rawTextEl("small", "composer-session-running", operationLabel(activeOperation.phase)));
+    load.addEventListener("click", safely(() => loadComposerSession(summary.id)));
+    const remove = el("button", "icon-button composer-session-delete quiet-danger");
+    remove.type = "button";
+    remove.disabled = running;
+    remove.title = t("删除");
+    remove.setAttribute("aria-label", `${t("删除")}：${summary.title}`);
+    remove.append(createUiIcon("x"));
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      safely(() => deleteSession(summary.id))();
+    });
+    row.append(load, remove);
+    return row;
+}
+
+function sessionDateGroup(value, now = new Date()) {
+  const updatedAt = new Date(value);
+  if (Number.isNaN(updatedAt.getTime())) return "older";
+  const localDay = (date) => Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000;
+  const elapsedDays = localDay(now) - localDay(updatedAt);
+  if (elapsedDays <= 0) return "today";
+  if (elapsedDays === 1) return "yesterday";
+  return elapsedDays <= 6 ? "recent" : "older";
+}
+
+function renderTimeline() {
+  if (!composerSession) return;
+  const session = displayedComposerSession();
+  const candidateScrollPositions = new Map([...elements.composerTimeline.querySelectorAll(".composer-library-candidate-list")]
+    .map((list) => [list.dataset.searchKey, list.scrollLeft]));
+  for (const image of elements.composerTimeline.querySelectorAll(".composer-library-candidate img")) imageObserver.unobserve(image);
+  const latestSearch = session.libraryTools.events.findLast(event => event.name === "search_cases" && event.status === "completed");
+  const inner = el("div", "composer-chat-inner");
+  const operation = currentComposerOperation();
+  const streamingText = currentStreamingText() || (!operation ? session.activeTurn?.partialText || "" : "");
+  if (!session.messages.length && !streamingText && !operation && !session.lastFailure) inner.append(createWelcome());
+  let promptIndex = 0;
+  let pendingUserMessageId = "";
+  for (const message of session.messages) {
+    const version = message.type === "prompt" ? session.promptVersions[promptIndex++] : null;
+    inner.append(createMessage(message, version, false, session));
+    if (message.role === "user") {
+      pendingUserMessageId = message.id;
+      const events = session.libraryTools.events.filter(event => event.userMessageId === message.id);
+      if (events.length) {
+        const record = el("div", "composer-tool-events");
+        record.setAttribute("role", "status");
+        record.append(...events.map(event => {
+          const line = rawTextEl("p", `composer-tool-event ${event.status}`, event.label);
+          if (event.name === "read_case_text" && event.status === "completed" && event.caseId) {
+            const link = rawTextEl("a", "composer-retrieved-source", event.label);
+            link.href = `library.html?case=${encodeURIComponent(event.caseId)}`;
+            link.target = "_blank";
+            line.replaceChildren(link);
+          }
+          return line;
+        }));
+        inner.append(record);
+
+      }
+    }
+    if (message.role === "assistant" && pendingUserMessageId) {
+      appendToolCards(pendingUserMessageId);
+      pendingUserMessageId = "";
+    }
+  }
+  if (pendingUserMessageId) appendToolCards(pendingUserMessageId);
+  if (!operation && session.libraryTools.requestCount) {
+    const stats = session.libraryTools;
+    const usage = stats.usage && stats.usageRequestCount === stats.requestCount
+      ? t("输入 {input} / 输出 {output} tokens", { input: stats.usage.promptTokens, output: stats.usage.completionTokens }) : t("用量未知");
+    inner.append(rawTextEl("p", "composer-tool-events composer-tool-summary", t("本轮 {requests} 次模型请求 · {images} 张图片 · {usage}", { requests: stats.requestCount, images: stats.imageIds.length, usage })));
+  }
+  if (streamingText) {
+    const route = operation?.session?.currentRoute || session.activeTurn?.route || "";
+    const type = route === "compose" ? "prompt" : route === "analyze_materials" ? "analysis" : "chat";
+    inner.append(createMessage({ role: "assistant", type, route: route === "auto" ? "" : route, content: streamingText }, null, true, session));
+  }
+  if (operation && !streamingText) {
+    inner.append(createMessage({ role: "assistant", type: "status", content: operationLabel(operation.phase) }, null, false, session));
+  }
+  if (!operation && session.lastFailure) {
+    inner.append(createFailureMessage(session.lastFailure));
+  }
+  function appendToolCards(userMessageId) {
+    const events = session.libraryTools.events.filter(event => event.userMessageId === userMessageId);
+    for (const event of events) {
+      if (event.draft && event.status === "completed") inner.append(createToolDraftCard(event, {
+        sessionId: session.id, busy: Boolean(operation), onSaved: saved => {
+          if (composerSession?.id === saved.id) { composerSession = createComposerSession(saved); renderTimeline(); }
+        }
+      }));
+      if (event.name !== "search_cases" || event.status !== "completed") continue;
+      const candidates = event.candidates ?? (event === latestSearch ? session.libraryTools.candidates : []);
+      if (!candidates.length) continue;
+      const results = el("section", "composer-library-results");
+      results.setAttribute("aria-label", t("查询候选"));
+      const list = el("div", "composer-library-candidate-list");
+      list.dataset.searchKey = JSON.stringify([event.userMessageId, event.callId]);
+      list.append(...candidates.map(createLibraryCandidate));
+      results.append(rawTextEl("small", "composer-retrieval-heading", t("查询候选 · {count} 个", { count: candidates.length })), list);
+      inner.append(results);
+    }
+  }
+
+  elements.composerTimeline.replaceChildren(inner);
+  for (const list of inner.querySelectorAll(".composer-library-candidate-list")) {
+    list.scrollLeft = candidateScrollPositions.get(list.dataset.searchKey) || 0;
+  }
+  releaseUnusedCreativeOutputUrls();
+  requestAnimationFrame(() => { elements.composerTimeline.scrollTop = elements.composerTimeline.scrollHeight; });
+}
+
+function releaseUnusedCreativeOutputUrls() {
+  const retained = new Set(creativeRuns
+    .filter((run) => run.sessionId === composerSession?.id)
+    .flatMap((run) => run.outputs.flatMap((output) => [
+      `creative:${output.visual.id}`,
+      `creative-poster:${output.visual.id}`
+    ])));
+  for (const [key, url] of thumbnailUrls) {
+    if (!key.startsWith("creative:") && !key.startsWith("creative-poster:")) continue;
+    if (retained.has(key)) continue;
+    URL.revokeObjectURL(url);
+    thumbnailUrls.delete(key);
+  }
+}
+
+function createWelcome() {
+  const wrap = el("section", "composer-welcome");
+  const body = el("div", "");
+  const image = document.createElement("img");
+  image.src = "assets/icons/icon-128.png";
+  image.alt = "";
+  body.append(
+    image,
+    rawTextEl("h1", "", currentLocale() === "en" ? "What would you like to do?" : "今天想做些什么？")
+  );
+  const suggestions = el("div", "composer-welcome-suggestions");
+  const values = ["找几个案例给我挑选", "把这段方法提炼成 Skill", "看看精选案例库有什么更新", "聊聊我的创作想法"];
+  for (const value of values) {
+    const button = rawTextEl("button", "", t(value));
+    button.type = "button";
+    button.addEventListener("click", () => {
+      elements.composerInstruction.value = t(value);
+      resizeComposerInput();
+      elements.composerInstruction.focus();
+    });
+    suggestions.append(button);
+  }
+  body.append(suggestions);
+  wrap.append(body);
+  return wrap;
+}
+
+function createMessage(message, version, streaming, session) {
+  const article = el("article", `composer-message ${message.role} ${message.type}`);
+  const content = el("div", "composer-message-content");
+  if (message.role === "assistant") {
+    const routeLabels = { compose: t("提示词装配"), analyze_materials: t("本地资料分析"), chat: t("普通对话") };
+    const label = routeLabels[message.route] || t("创作助手");
+    content.append(rawTextEl("small", "composer-message-label", label));
+  }
+  const messageClass = streaming ? " composer-streaming-caret" : "";
+  const messageText = renderFinalAssistantText(message, streaming, messageClass);
+  if (message.type === "status") setTaskFeedbackState(messageText, { pending: true });
+  content.append(messageText);
+  if (message.type === "question" && message.options?.length) {
+    if (message.recommendedAnswer) content.append(rawTextEl("p", "composer-question-recommendation", t("推荐：{answer}", { answer: message.recommendedAnswer })));
+    const options = el("div", "composer-question-options");
+    options.append(...message.options.map((option) => {
+      const button = rawTextEl("button", "button-secondary", option);
+      button.type = "button";
+      button.disabled = Boolean(activeOperation);
+      button.addEventListener("click", () => {
+        elements.composerInstruction.value = option;
+        safely(handleComposerAction)();
+      });
+      return button;
+    }));
+    content.append(options);
+  }
+  if (version) {
+    const sourceSnapshot = createRetrievedSourceSnapshot(version.retrievedSources);
+    if (sourceSnapshot) content.append(sourceSnapshot);
+    const actions = el("div", "composer-message-actions");
+    const copy = textEl("button", "button-secondary", "复制");
+    const addResult = session.targetType === "image" ? textEl("button", "button-secondary", "添加生成图片") : null;
+    const save = textEl("button", "button-secondary", "保存为案例");
+    const checks = composerOutputChecks(session, version);
+    const failures = checks.filter((check) => check.status === "failed");
+    copy.disabled = failures.length > 0;
+    if (addResult) addResult.disabled = failures.length > 0;
+    save.disabled = failures.length > 0;
+    copy.addEventListener("click", () => copyPrompt(version, copy));
+    addResult?.addEventListener("click", () => prepareCreativeResult(session.id, version, addResult));
+    save.addEventListener("click", () => savePromptVersion(session.id, version, save));
+    actions.append(copy);
+    if (addResult) actions.append(addResult);
+    actions.append(save);
+    content.append(actions);
+    const outputCards = createCreativeOutputCards(session.id, version.id);
+    if (outputCards.length) {
+      const results = el("section", "composer-result-list");
+      results.append(...outputCards);
+      content.append(results);
+    }
+    if (failures.length) {
+      const checkList = el("div", "composer-checks");
+      for (const check of failures) checkList.append(rawTextEl("span", "composer-check failed", check.message));
+      content.append(checkList);
+    }
+  }
+  article.append(content);
+  return article;
+}
+
+function renderFinalAssistantText(message, streaming, messageClass = "") {
+  if (message.role !== "assistant" || streaming || !["chat", "analysis"].includes(message.type)) {
+    return rawTextEl("p", `composer-message-text${messageClass}`, message.content);
+  }
+  const rendered = renderMarkdownDocument(message.content);
+  rendered.classList.add("composer-message-text");
+  return rendered;
+}
+
+function createFailureMessage(failure) {
+  const article = el("article", `composer-message assistant ${failure.kind === "stopped" ? "status" : "failure"}`);
+  const content = el("div", "composer-message-content");
+  content.append(
+    rawTextEl("small", "composer-message-label", t("创作助手")),
+    rawTextEl("p", "composer-message-text", failure.message)
+  );
+  if (failure.retryable) {
+    const actions = el("div", "composer-message-actions");
+    const retry = textEl("button", "button-secondary", "重试本轮");
+    retry.addEventListener("click", () => safely(retryComposerTurn)());
+    actions.append(retry);
+    content.append(actions);
+  }
+  article.append(content);
+  return article;
+}
+
+async function handleComposerAction() {
+  if (activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession?.id) {
+    await stopActiveOperation();
+    return;
+  }
+  await sendComposerTurn();
+}
+
+async function sendComposerTurn() {
+  if (!composerSession) return;
+  if (activeOperation) return composerFeedback("另一项创作任务正在运行，请先等待或停止", true);
+  const instruction = elements.composerInstruction.value.trim();
+  if (!instruction) return composerFeedback("请先输入本轮任务", true);
+  const answeringQuestion = composerSession.messages.at(-1)?.type === "question";
+  const wasEmpty = composerSession.messages.length === 0 && composerSession.promptVersions.length === 0;
+  let working = appendComposerMessage(clearComposerFailure(composerSession), {
+    role: "user",
+    type: answeringQuestion ? "answer" : "request",
+    content: instruction,
+    route: composerSession.routeMode === "auto" ? "" : composerSession.routeMode,
+    routeSource: composerSession.routeMode === "auto" ? "auto" : "manual"
+  });
+  working = createComposerSession({
+    ...working, currentInstruction: "", currentRoute: "", currentRouteSource: "",
+    retrievedSources: [], retrievalSnapshot: null,
+    libraryTools: { ...working.libraryTools, requestCount: 0, usage: null, imageIds: [] }
+  });
+  const userMessageId = working.messages.at(-1).id;
+  if (wasEmpty) working.title = conversationTitle(instruction);
+  elements.composerInstruction.value = "";
+  const turnPolicy = composerTurnPolicyFor(working);
+  const turnId = crypto.randomUUID();
+  working = createComposerSession({
+    ...working,
+    assemblySnapshot: freezeComposerAssemblySnapshot(working, {
+      turnId,
+      userMessageId,
+      userRequest: instruction,
+      policy: turnPolicy
+    })
+  });
+  const prepared = prepareComposerTurnStart(working, turnPolicy);
+  working = prepared.session;
+  if (["create_image", "create_video"].includes(working.outputMode) || sessionHasVideoReferences(working)) {
+    composerSession = working;
+    renderComposer();
+    try {
+      await startPersistentCreativeJob({ session: working, userMessageId, startPhase: prepared.startPhase, imageEdit: null });
+    } catch (error) {
+      composerSession = setComposerFailure(working, {
+        userMessageId,
+        phase: "saving",
+        kind: "storage",
+        message: error.message || t("无法启动后台创作任务"),
+        retryable: true
+      });
+      composerSession = await saveSession(composerSession).catch(() => composerSession);
+      renderComposer();
+    }
+    return;
+  }
+  const selectedService = selectedComposerService(working.aiProfile, composerAiSettings, composerVisionSettings);
+  const serviceLabel = selectedService.shortLabel;
+  working = createComposerSession({
+    ...working,
+    activeTurn: createComposerActiveTurn({
+      turnId,
+      userMessageId,
+      route: prepared.executionRoute,
+      routeSource: working.currentRouteSource,
+      serviceId: working.aiProfile.serviceId,
+      model: selectedService.model || working.aiProfile.model
+    })
+  });
+  working = appendDiagnosticEvent(working, {
+    phase: prepared.startPhase,
+    status: "started",
+    detail: prepared.startPhase === "streaming" ? routeOperationLabel(prepared.executionRoute) : t("{service} 正在规划", { service: serviceLabel })
+  });
+  const controller = new AbortController();
+  activeOperation = {
+    kind: "compose",
+    sessionId: working.id,
+    phase: prepared.startPhase,
+    requestPhase: prepared.startPhase,
+    executionRoute: prepared.executionRoute,
+    userMessageId,
+    controller,
+    session: working,
+    streamingText: ""
+  };
+  const operation = activeOperation;
+  operation.checkpointWriter = createLatestCheckpointWriter(async (snapshot) => {
+    const saved = await saveSession(snapshot);
+    operation.session = saved;
+    return saved;
+  });
+  composerSession = working;
+  renderComposer();
+  try {
+    activeOperation.session = await saveSession(working);
+    await runComposerTurn(activeOperation, prepared.startPhase);
+  } catch (error) {
+    const operation = activeOperation;
+    if (operation?.sessionId === working.id) {
+      const details = composerServiceErrorDetails(error);
+      composerSession = setComposerFailure(operation.session, {
+        userMessageId,
+        phase: "saving",
+        kind: details.kind === "unknown" ? "storage" : details.kind,
+        message: error.message || t("无法保存创作草稿"),
+        retryable: true
+      });
+      activeOperation = null;
+    }
+    renderComposer();
+  }
+}
+
+function positionComposerInputMenu(menu) {
+  const panel = menu.querySelector(".composer-toolbar-panel");
+  const anchor = menu.querySelector("summary").getBoundingClientRect();
+  const style = getComputedStyle(menu);
+  const inset = Number.parseFloat(style.getPropertyValue("--ui-popover-viewport-inset"));
+  const gap = Number.parseFloat(style.getPropertyValue("--ui-popover-gap"));
+  const width = Number.parseFloat(getComputedStyle(panel).width);
+  const right = Math.min(document.documentElement.clientWidth, elements.composerShell.getBoundingClientRect().right);
+  panel.style.left = `${Math.max(inset, Math.min(anchor.left, right - width - inset))}px`;
+  panel.style.bottom = `${innerHeight - anchor.top + gap}px`;
+  panel.style.maxHeight = `${Math.max(0, anchor.top - gap - inset)}px`;
+}
+
+function renderReferenceInputs() {
+  const direction = composerSession.targetType === "video" ? "video" : "image";
+  elements.composerDirectionIcon.setAttribute("href", `assets/ui-icons.svg#icon-${direction}`);
+  const directionTitle = t("创作方向：{type}。影响提示词和可选参考，不会直接生成成品。", { type: t(direction === "video" ? "视频" : "图片") });
+  elements.composerDirectionTrigger.title = directionTitle;
+  elements.composerDirectionTrigger.setAttribute("aria-label", directionTitle);
+  document.querySelectorAll('input[name="composer-type"]').forEach(input => { input.disabled = Boolean(activeOperation); });
+  const hasImages = composerSession.referenceSnapshots.some(reference => reference.imageRefs?.length)
+    || libraryRetrievalEnabled && entries.some(entry => entryMediaAssets(entry)
+      .some(asset => asset.kind === "image" && asset.usage !== "poster"));
+  const hasVideos = sessionHasVideoReferences(composerSession);
+  elements.composerReferenceInputs.hidden = !hasImages && !hasVideos;
+  if (elements.composerReferenceInputs.hidden) elements.composerReferenceInputs.open = false;
+  elements.composerSendImagesField.hidden = !hasImages;
+  elements.composerSendVideosField.hidden = !hasVideos;
+  elements.composerSendImages.checked = composerSession.imageReferenceMode !== "text_only";
+  elements.composerSendVideos.checked = composerSession.videoReferenceMode !== "text_only";
+  elements.composerSendImages.disabled = elements.composerSendVideos.disabled = Boolean(activeOperation);
+  const images = hasImages && elements.composerSendImages.checked;
+  const videos = hasVideos && elements.composerSendVideos.checked;
+  const referenceTitle = images && videos ? t("参考输入：文字＋原图＋原视频")
+    : images ? t("参考输入：文字＋原图") : videos ? t("参考输入：文字＋原视频") : t("参考输入：仅文字");
+  elements.composerReferenceInputsTrigger.title = referenceTitle;
+  elements.composerReferenceInputsTrigger.setAttribute("aria-label", referenceTitle);
+  elements.composerReferenceInputsTrigger.dataset.originals = String(images || videos);
+}
+
+async function retryComposerTurn() {
+  if (!composerSession || activeOperation) return;
+  const failedUserMessageId = composerSession.lastFailure?.userMessageId;
+  if (lastCreativeJob?.sessionId === composerSession.id &&
+      lastCreativeJob.userMessageId === failedUserMessageId &&
+      ["failed", "canceled", "interrupted"].includes(lastCreativeJob.status) &&
+      lastCreativeJob.error?.retryable) {
+    if (!await confirmAppAction({ title: t("重新发起付费请求？"), description: t("上一次请求可能已经产生费用。重试会创建一个新任务，并可能再次计费。"), confirmLabel: t("继续重试") })) return;
+    const response = await chrome.runtime.sendMessage({ type: "RETRY_CREATIVE_JOB", jobId: lastCreativeJob.id });
+    if (!response?.ok) throw new Error(response?.message || "无法重新开始创作任务");
+    creativeJobs = { ...creativeJobs, items: [...(creativeJobs.items ?? []), response.job] };
+    setActiveCreativeJob(response.job);
+    renderComposer();
+    return;
+  }
+  if (!composerSession.lastFailure?.retryable) return;
+  if (["create_image", "create_video"].includes(composerSession.outputMode) || sessionHasVideoReferences(composerSession)) {
+    // Media turns run only as background jobs; the in-page path cannot persist their results or send video references.
+    if ((creativeJobs.items ?? []).some(item => item.sessionId === composerSession.id && item.userMessageId === failedUserMessageId)) {
+      throw new Error(composerSession.lastFailure.message);
+    }
+    const failure = composerSession.lastFailure;
+    const working = clearComposerFailure(composerSession);
+    composerSession = working;
+    renderComposer();
+    try {
+      await startPersistentCreativeJob({ session: working, userMessageId: failure.userMessageId, startPhase: working.currentInstruction ? "generation" : "planning", imageEdit: null });
+    } catch (error) {
+      composerSession = setComposerFailure(working, { ...failure, message: error.message || failure.message });
+      composerSession = await saveSession(composerSession).catch(() => composerSession);
+      renderComposer();
+    }
+    return;
+  }
+  if (composerSession.activeTurn?.providerMayHaveAccepted && !await confirmAppAction({
+    title: t("重新发起文字请求？"),
+    description: t("上一次请求可能已经被服务商接收。重试会发起新的请求，并可能再次计费；已保留的部分内容不会覆盖新结果。"),
+    confirmLabel: t("继续重试")
+  })) return;
+  const failure = composerSession.lastFailure;
+  const executionRoute = composerSession.routeMode === "auto" ? "auto" : composerSession.currentRoute;
+  const startPhase = failure.phase === "streaming" && composerSession.currentInstruction && executionRoute ? "streaming" : "planning";
+  let working = clearComposerFailure(composerSession);
+  working = appendDiagnosticEvent(working, {
+    phase: startPhase,
+    status: startPhase === "streaming" ? "retrying" : "started",
+    detail: startPhase === "streaming" ? "重试生成" : "重试规划"
+  });
+  const selectedService = selectedComposerService(working.aiProfile, composerAiSettings, composerVisionSettings);
+  working = createComposerSession({
+    ...working,
+    activeTurn: createComposerActiveTurn({
+      turnId: crypto.randomUUID(),
+      userMessageId: failure.userMessageId,
+      route: executionRoute,
+      routeSource: working.currentRouteSource,
+      serviceId: working.aiProfile.serviceId,
+      model: selectedService.model || working.aiProfile.model
+    })
+  });
+  const controller = new AbortController();
+  activeOperation = {
+    kind: "compose",
+    sessionId: working.id,
+    phase: startPhase,
+    requestPhase: startPhase,
+    executionRoute,
+    userMessageId: failure.userMessageId,
+    controller,
+    session: working,
+    streamingText: ""
+  };
+  const operation = activeOperation;
+  operation.checkpointWriter = createLatestCheckpointWriter(async (snapshot) => {
+    const saved = await saveSession(snapshot);
+    operation.session = saved;
+    return saved;
+  });
+  composerSession = working;
+  renderComposer();
+  try {
+    activeOperation.session = await saveSession(working);
+    await runComposerTurn(activeOperation, startPhase);
+  } catch (error) {
+    const operation = activeOperation;
+    if (operation) {
+      composerSession = setComposerFailure(operation.session, {
+        userMessageId: failure.userMessageId,
+        phase: "saving",
+        kind: "storage",
+        message: error.message || t("无法保存创作草稿"),
+        retryable: true
+      });
+      activeOperation = null;
+      renderComposer();
+    }
+  }
+}
+
+async function runComposerTurn(operation, startPhase = "planning") {
+  if (!operation || operation.kind !== "compose") return;
+  try {
+    const settingsValue = await privateComposerServiceSettings();
+    const executionRoute = operation.executionRoute
+      || (operation.session.routeMode === "auto" ? "auto" : operation.session.currentRoute);
+    if (startPhase === "streaming" && operation.session.currentInstruction && executionRoute) {
+      await runAgentExecution(operation, settingsValue, executionRoute, operation.session.currentInstruction);
+      return;
+    }
+    const planning = await planComposerSession({
+      session: operation.session,
+      composerSettings,
+      settings: settingsValue,
+      signal: operation.controller.signal
+    });
+    let working = planning.session;
+    const planned = planning.planned;
+    if (planning.needsClarification) {
+      operation.session = await saveSession(working);
+      return;
+    }
+    if (planned.notice && composerSession?.id === working.id) composerFeedback(t(planned.notice));
+    operation.session = await saveSession(working);
+    await runAgentExecution(operation, settingsValue, planned.route, planned.instruction);
+  } catch (error) {
+    await persistComposerFailure(operation, error);
+  } finally {
+    if (activeOperation === operation) activeOperation = null;
+    renderComposer();
+  }
+}
+
+async function rebuildComposerSearchIndex() {
+  const state = await createComposerSearchState(entries);
+  composerDocumentTextByEntryId = state.documentTextByEntryId;
+  composerSearchIndex = state.searchIndex;
+}
+
+async function createComposerSearchState(sourceEntries) {
+  const documentIds = [...new Set(sourceEntries.flatMap((entry) => entryMediaAssets(entry))
+    .filter((asset) => asset.kind === "document")
+    .map((asset) => asset.id))];
+  const [derived, metadata] = await Promise.all([
+    Promise.all(documentIds.map(async (id) => [id, await getDerivedMedia(id).catch(() => null)])),
+    getAllDerivedMetadata()
+  ]);
+  const documentText = new Map(derived.flatMap(([id, value]) => value?.searchText ? [[id, value.searchText]] : []));
+  const documentTextByEntryId = new Map(sourceEntries.flatMap((entry) => {
+    const text = entryMediaAssets(entry).map((asset) => documentText.get(asset.id)).filter(Boolean).join("\n").trim();
+    return text ? [[entry.id, text]] : [];
+  }));
+  return {
+    documentTextByEntryId,
+    searchIndex: buildSearchIndex(sourceEntries, facetCatalog, documentText, metadata)
+  };
+}
+
+async function runAgentExecution(operation, settingsValue, route, instruction) {
+  operation.phase = "streaming";
+  operation.requestPhase = "streaming";
+  operation.executionRoute = route;
+  operation.session = appendDiagnosticEvent(operation.session, { phase: "streaming", status: "started", detail: routeOperationLabel(route) });
+  operation.session = createComposerSession({
+    ...operation.session,
+    activeTurn: updateComposerActiveTurn(operation.session.activeTurn, {
+      status: "waiting",
+      phase: "waiting",
+      route,
+      updatedAt: new Date().toISOString()
+    })
+  });
+  operation.session = await saveSession(operation.session);
+  renderActiveState();
+  const preparedImages = operation.session.imageReferenceMode === "text_only"
+    ? []
+    : await prepareSelectedReferenceImages(operation.session);
+  let pendingImageIds = preparedImages.map(image => image.visualId);
+  const toolRuntime = createLocalComposerLibraryTools({
+    session: operation.session,
+    userMessageId: operation.userMessageId,
+    vision: operation.session.imageReferenceMode !== "text_only",
+    onEvent: async event => {
+      operation.controller.signal.throwIfAborted();
+      if (event.status === "completed" && event.imageIds) pendingImageIds.push(...event.imageIds);
+      operation.session = createComposerSession(applyLibraryToolEvent(operation.session, event));
+      operation.session = await saveSession(operation.session);
+      if (composerSession?.id === operation.sessionId) { composerSession = operation.session; renderTimeline(); renderSendState(); }
+    },
+    onRequest: async ({ usage, requestCount }) => {
+      await operation.checkpointWriter?.drain();
+      operation.session = createComposerSession({ ...operation.session, libraryTools: { ...operation.session.libraryTools, usage, usageRequestCount: requestCount } });
+    }
+  });
+  const result = await executeComposerTurnWithService({
+      session: operation.session,
+      userMessage: "",
+      composerSettings,
+      route,
+      instruction,
+      imageEdit: operation.imageEdit
+    }, settingsValue, preparedImages, {
+      signal: operation.controller.signal,
+      toolRuntime,
+      onRequestStart: async () => {
+        operation.session = createComposerSession({ ...operation.session, libraryTools: { ...operation.session.libraryTools, requestCount: operation.session.libraryTools.requestCount + 1, imageIds: [...new Set([...operation.session.libraryTools.imageIds, ...pendingImageIds])] } });
+        pendingImageIds = [];
+        recordComposerActualStage(operation, "requesting_model");
+
+        operation.session = createComposerSession({
+          ...operation.session,
+          activeTurn: updateComposerActiveTurn(operation.session.activeTurn, {
+            providerMayHaveAccepted: true,
+            updatedAt: new Date().toISOString()
+          })
+        });
+        try {
+          operation.session = await saveSession(operation.session);
+        } catch (error) {
+          operation.session = appendDiagnosticEvent(operation.session, {
+            phase: "requesting_model",
+            status: "checkpoint_failed",
+            detail: t("服务请求已经发出，但本地状态检查点保存失败：{reason}", { reason: translateUiMessage(error.message || "存储不可用") })
+          });
+          if (composerSession?.id === operation.sessionId) composerSession = operation.session;
+        }
+      },
+      onDelta: (_delta, content) => {
+        recordComposerActualStage(operation, "receiving_text");
+        operation.streamingText = content;
+        checkpointComposerOperation(operation, {
+          status: "receiving",
+          phase: "streaming",
+          partialText: content,
+          updatedAt: new Date().toISOString()
+        });
+        if (composerSession?.id === operation.sessionId) renderStreamingText();
+      }
+  });
+  recordComposerActualStage(operation, "response_completed");
+  await operation.checkpointWriter?.drain();
+  operation.streamingText = "";
+  if (result.protocolDegraded) {
+    operation.session = appendDiagnosticEvent(operation.session, {
+      phase: "streaming",
+      status: "degraded",
+      detail: "自动路由控制信息无效，已保留原回答并按普通对话保存"
+    });
+  }
+  operation.session = appendDiagnosticEvent(operation.session, {
+    phase: "streaming",
+    status: "completed",
+    detail: t("输入 {input} / 输出 {output} tokens", { input: result.usage.promptTokens, output: result.usage.completionTokens })
+  });
+  const working = createComposerSession({
+    ...applyComposerServiceResult(operation.session, result, composerSettings, route, instruction),
+    assemblySnapshot: completeComposerAssemblySnapshot(operation.session.assemblySnapshot, {
+      ...result,
+      libraryTools: operation.session.libraryTools,
+      retrievedSources: operation.session.retrievedSources,
+      actualStages: operation.actualStages
+    }),
+    activeTurn: null
+  });
+  operation.session = await saveSession(working);
+  if (result.route !== "compose") return;
+  if (result.kind === "image") {
+    creativeRuns = await persistGeneratedImages(
+      operation.session,
+      operation.session.promptVersions.at(-1)?.id,
+      result.images,
+      {
+        parentVisualId: operation.imageEdit?.parentVisualId,
+        editMode: operation.imageEdit?.mode,
+        serviceId: result.serviceId,
+        requestModel: result.requestModel,
+        responseModel: result.model,
+        requestParameters: result.requestParameters,
+        modification: operation.imageEdit?.modification
+      }
+    );
+  }
+}
+
+async function persistComposerFailure(operation, error) {
+  await operation.checkpointWriter?.drain().catch(() => undefined);
+  const details = composerServiceErrorDetails(error);
+  details.actualStages = operation.actualStages;
+  const phase = operation.requestPhase === "streaming" ? "streaming" : "planning";
+  let working = appendDiagnosticEvent(operation.session, {
+    phase,
+    status: details.kind === "stopped" ? "stopped" : "failed",
+    detail: details.message
+  });
+  working = setComposerFailure(working, {
+    userMessageId: operation.userMessageId,
+    phase,
+    kind: details.kind,
+    message: details.kind === "stopped" ? details.message : t("{message}。本轮内容已保留。", { message: translateUiMessage(details.message) }),
+    retryable: operation.imageEdit ? false : details.retryable
+  });
+  working = createComposerSession({
+    ...working,
+    libraryTools: settleLibraryToolEvents(working.libraryTools, operation.userMessageId, details.message),
+    assemblySnapshot: failComposerAssemblySnapshot(working.assemblySnapshot, details),
+    activeTurn: updateComposerActiveTurn(working.activeTurn, {
+      status: details.kind === "stopped" ? "stopped" : "failed",
+      phase: details.kind === "stopped" ? "stopped" : "failed",
+      partialText: operation.streamingText || working.activeTurn?.partialText || "",
+      updatedAt: new Date().toISOString()
+    })
+  });
+  operation.streamingText = "";
+  try {
+    operation.session = await saveSession(working);
+  } catch {
+    operation.session = working;
+    if (composerSession?.id === operation.sessionId) composerSession = working;
+  }
+}
+
+function recordComposerActualStage(operation, stageValue) {
+  const stage = String(stageValue ?? "").trim();
+  if (!stage) return;
+  operation.actualStages ??= [];
+  if (!operation.actualStages.includes(stage)) operation.actualStages.push(stage);
+}
+
+async function stopActiveOperation() {
+  if (!activeOperation) return;
+  if (activeOperation.durable) {
+    const operation = activeOperation;
+    operation.phase = "stopping";
+    renderActiveState();
+    const response = await chrome.runtime.sendMessage({ type: "CANCEL_CREATIVE_JOB", jobId: operation.jobId });
+    if (!response?.ok) {
+      operation.phase = operation.requestPhase === "planning" ? "planning" : "streaming";
+      renderActiveState();
+      throw new Error(response?.message || "后台任务无法停止");
+    }
+    lastCreativeJob = response.job;
+    activeOperation = null;
+    await refreshCreativeResultState();
+    renderComposer();
+    return;
+  }
+  activeOperation.phase = "stopping";
+  checkpointComposerOperation(activeOperation, {
+    status: "stop_requested",
+    phase: "stopping",
+    stopRequestedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  });
+  activeOperation.controller.abort();
+  renderActiveState();
+}
+
+async function startPersistentCreativeJob({ session, userMessageId, startPhase, imageEdit, jobId = "" }) {
+  requireAiRuntimeProtocolVersion(composerAiRuntimeProtocolVersion);
+  const response = await chrome.runtime.sendMessage({
+    type: "START_CREATIVE_JOB",
+    jobId,
+    request: { session, userMessageId, startPhase: startPhase === "streaming" ? "generation" : startPhase, imageEdit }
+  });
+  if (!response?.ok) throw new Error(response?.message || "后台创作任务启动失败");
+  creativeJobs = { ...creativeJobs, items: [...(creativeJobs.items ?? []), response.job] };
+  lastCreativeJob = response.job;
+  setActiveCreativeJob(response.job);
+  renderComposer();
+  return response.job;
+}
+
+function setActiveCreativeJob(job) {
+  activeOperation = {
+    kind: "compose",
+    durable: true,
+    jobId: job.id,
+    sessionId: job.sessionId,
+    phase: job.executionState === "stop_requested" ? "stopping" : job.phase === "planning" ? "planning" : "streaming",
+    requestPhase: job.phase,
+    executionRoute: job.request.session.currentRoute || "compose",
+    userMessageId: job.userMessageId,
+    session: job.request.session,
+    streamingText: ""
+  };
+}
+
+function renderActiveState() {
+  renderSessions();
+  renderSendState();
+  renderTimeline();
+  if (elements.composerReferenceWorkspace.hidden === false) renderProjects();
+}
+
+function renderStreamingText() {
+  const node = elements.composerTimeline.querySelector(".composer-streaming-caret");
+  if (node) node.textContent = currentStreamingText();
+  else renderTimeline();
+  elements.composerTimeline.scrollTop = elements.composerTimeline.scrollHeight;
+}
+
+function checkpointComposerOperation(operation, patch) {
+  if (!operation?.session?.activeTurn) return;
+  operation.session = createComposerSession({
+    ...operation.session,
+    activeTurn: updateComposerActiveTurn(operation.session.activeTurn, patch),
+    updatedAt: new Date().toISOString()
+  });
+  if (!operation.checkpointWriter) {
+    operation.checkpointWriter = createLatestCheckpointWriter(async (snapshot) => {
+      const saved = await saveSession(snapshot);
+      operation.session = saved;
+      return saved;
+    });
+  }
+  operation.checkpointWriter.schedule(operation.session).catch((error) => {
+    operation.checkpointError = error;
+  });
+}
+
+function currentStreamingText() {
+  return activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession?.id
+    ? activeOperation.streamingText
+    : "";
+}
+
+function currentComposerOperation() {
+  return activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession?.id
+    ? activeOperation
+    : null;
+}
+
+function displayedComposerSession() {
+  return currentComposerOperation()?.session ?? composerSession;
+}
+
+function toggleComposerModelMenu(event) {
+  event.stopPropagation();
+  if (elements.composerModelTrigger.disabled) return;
+  const open = elements.composerModelMenu.hidden;
+  if (open) openComposerModelMenu();
+  else closeComposerModelMenu();
+}
+
+function openComposerModelMenu() {
+  if (elements.composerModelTrigger.disabled) return;
+  elements.composerModelMenu.hidden = false;
+  elements.composerModelTrigger.setAttribute("aria-expanded", "true");
+  elements.composerModelTrigger.focus();
+}
+
+function closeComposerModelMenu() {
+  elements.composerModelMenu.hidden = true;
+  elements.composerModelTrigger.setAttribute("aria-expanded", "false");
+}
+
+function renderComposerAiProfile() {
+  const profile = activeComposerProfile();
+  const catalog = composerServiceCatalog(composerAiSettings, composerVisionSettings);
+  const service = selectedComposerService(profile, composerAiSettings, composerVisionSettings);
+  const reasoningAvailable = service.reasoning === true;
+  const name = translateUiMessage(service.shortLabel || service.label).replace("未选择模型", t("未选择模型"));
+  elements.composerModelLabel.textContent = composerSession?.outputMode === "create_image"
+    ? `${name} · ${t("生图")}`
+    : composerSession?.outputMode === "create_video" ? `${name} · ${t("视频")}`
+    : reasoningAvailable && profile.thinking ? `${name} · ${t("思考")}` : name;
+  elements.composerModelLabel.title = translateUiMessage(service.label).replace("未选择模型", t("未选择模型"));
+  const selected = (serviceId, model) => profile.serviceId === serviceId && (!model || profile.model === model);
+  elements.composerModelFlash.setAttribute("aria-checked", String(selected("deepseek", "deepseek-flash")));
+  elements.composerModelPro.setAttribute("aria-checked", String(selected("deepseek", "deepseek-v4-pro")));
+  elements.composerModelOpenai.setAttribute("aria-checked", String(selected("openai")));
+  elements.composerModelCompatible.setAttribute("aria-checked", String(selected("compatible")));
+  elements.composerModelXai.setAttribute("aria-checked", String(selected("xai")));
+  const openai = catalog.find((item) => item.serviceId === "openai");
+  const compatible = catalog.find((item) => item.serviceId === "compatible");
+  const xai = catalog.find((item) => item.serviceId === "xai");
+  elements.composerModelOpenaiLabel.textContent = translateUiMessage(openai?.label || "OpenAI").replace("未选择模型", t("未选择模型"));
+  elements.composerModelCompatibleLabel.textContent = translateUiMessage(compatible?.label || t("兼容视觉服务"))
+    .replace("兼容服务", t("兼容服务"))
+    .replace("未选择模型", t("未选择模型"));
+  elements.composerModelXaiLabel.textContent = translateUiMessage(xai?.label || "xAI").replace("未选择模型", t("未选择模型"));
+  elements.composerModelOpenai.querySelector("small").textContent = t(openai?.configured ? "读取手选原图与对应提示词" : "未配置，前往分析设置");
+  elements.composerModelCompatible.querySelector("small").textContent = t(compatible?.configured ? "读取手选原图与对应提示词" : "未配置，前往分析设置");
+  elements.composerModelXai.querySelector("small").textContent = xai?.configured
+    ? t("读取文字与手选原图，并按已配置能力创建图片或视频")
+    : t("未配置，前往 AI 服务与任务分工");
+  renderGenerationModelChoices(profile);
+  elements.composerThinking.checked = reasoningAvailable && profile.thinking;
+  elements.composerModelTrigger.disabled = Boolean(activeOperation);
+  elements.composerModelFlash.disabled = Boolean(activeOperation);
+  elements.composerModelPro.disabled = Boolean(activeOperation);
+  elements.composerModelOpenai.disabled = Boolean(activeOperation);
+  elements.composerModelCompatible.disabled = Boolean(activeOperation);
+  elements.composerModelXai.disabled = Boolean(activeOperation);
+  elements.composerThinking.disabled = Boolean(activeOperation) || !reasoningAvailable;
+  const videoTask = composerSession?.targetType === "video";
+  const generationProfile = generationRouteProfile(videoTask);
+  const mediaAvailability = videoTask
+    ? composerVideoAvailability(generationProfile, composerVisionSettings, { ...composerSession, aiProfile: generationProfile })
+    : composerImageAvailability(generationProfile, composerVisionSettings, { ...composerSession, aiProfile: generationProfile });
+  elements.composerCreateMediaLabel.textContent = t(videoTask ? "创建视频" : "创建图片");
+  elements.composerCreateImage.checked = composerSession?.outputMode === (videoTask ? "create_video" : "create_image");
+  elements.composerCreateImage.disabled = Boolean(activeOperation) || !mediaAvailability.available;
+  const availabilityMessage = activeOperation ? t("生成期间不能修改当前对话设置") : translateUiMessage(mediaAvailability.message);
+  elements.composerCreateImageNote.textContent = availabilityMessage;
+  const createMediaLabel = elements.composerCreateImage.closest('label');
+  createMediaLabel.title = availabilityMessage;
+  if (elements.composerCreateImage.disabled) createMediaLabel.tabIndex = 0;
+  else createMediaLabel.removeAttribute('tabindex');
+  elements.composerProductionReview.disabled = Boolean(activeOperation) || !["auto", "compose"].includes(composerSession?.routeMode);
+  renderImageGenerationSettings();
+}
+
+function renderGenerationModelChoices(selectedProfile) {
+  const generationMode = ["create_image", "create_video"].includes(composerSession?.outputMode);
+  const videoTask = generationMode && composerSession.outputMode === "create_video";
+  const taskId = generationMode ? (videoTask ? "videoGeneration" : "imageGeneration") : "creativePlanning";
+  const profiles = composerVisionSettings.providerProfiles ?? {};
+  const choices = availableAiModelChoicesForTask(taskId, { providers: profiles }).flatMap((choice) => {
+    const provider = profiles[choice.providerId];
+    const candidate = composerProfileForTaskAssignment({ providerId: choice.providerId, model: choice.modelId }, selectedProfile);
+    if (candidate.serviceId === "unassigned") return [];
+    if (!generationMode) {
+      return [{ provider, candidate }];
+    }
+    const capability = composerServiceCapabilities(candidate, composerVisionSettings)[videoTask ? "video" : "image"];
+    return capability?.generate ? [{ provider, candidate }] : [];
+  });
+  for (const button of [elements.composerModelFlash, elements.composerModelPro, elements.composerModelOpenai, elements.composerModelCompatible, elements.composerModelXai]) {
+    button.hidden = true;
+  }
+  elements.composerModelDynamic.hidden = false;
+  elements.composerModelDynamic.replaceChildren(...choices.map(({ provider, candidate }) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitemradio");
+    button.setAttribute("aria-checked", String(candidate.serviceId === selectedProfile.serviceId && candidate.model === selectedProfile.model));
+    const copy = document.createElement("span");
+    copy.append(rawTextEl("b", "", translateUiMessage(provider.label || provider.id)), rawTextEl("small", "", candidate.model));
+    button.append(copy, rawTextEl("span", "", "✓"));
+    button.addEventListener("click", () => safely(() => updateComposerAiProfile(candidate))());
+    return button;
+  }));
+  if (!choices.length) elements.composerModelDynamic.append(rawTextEl(
+    "p",
+    "composer-model-empty",
+    t(generationMode ? "没有已连接且支持当前生成任务的模型" : "没有已连接且支持创作规划的模型")
+  ));
+}
+
+function renderImageGenerationSettings() {
+  const videoTask = composerSession?.targetType === "video";
+  const generationProfile = generationRouteProfile(videoTask);
+  const capability = composerServiceCapabilities(generationProfile, composerVisionSettings)[videoTask ? "video" : "image"];
+  const hasImageSize = capability?.parameters?.some((parameter) => ["size", "aspectRatio", "imageSize"].includes(parameter.key));
+  const visible = videoTask
+    ? composerSession?.outputMode === "create_video" && Boolean(capability?.generate)
+    : Boolean(capability?.generate && hasImageSize);
+  elements.composerGenerationSettings.hidden = !visible;
+  if (!visible) return;
+  elements.composerGenerationSettingsTitle.textContent = t(videoTask ? "本轮视频参数" : "本轮图片参数");
+  const state = videoTask
+    ? normalizeVideoGenerationRequest(generationProfile, composerVisionSettings, composerSession.generationParameters)
+    : normalizeImageGenerationRequest(generationProfile, composerVisionSettings, composerSession.generationParameters);
+  if (videoTask) {
+    renderGenerationParameterField(elements.composerImageSizeField, elements.composerImageSize, capability, "size", composerSession.generationParameters.size, {
+      showAutomatic: true,
+      fallbackLabel: "画幅与分辨率"
+    });
+    elements.composerImageQualityField.hidden = true;
+    elements.composerImageReferenceModeField.hidden = true;
+    renderGenerationParameterField(elements.composerVideoDurationField, elements.composerVideoDuration, capability, "duration", composerSession.generationParameters.duration, {
+      fallbackLabel: "时长"
+    });
+  } else {
+    const primaryKey = generationParameterKey(capability, ["size", "aspectRatio"]);
+    const secondaryKey = generationParameterKey(capability, ["quality", "imageSize"]);
+    renderGenerationParameterField(elements.composerImageSizeField, elements.composerImageSize, capability, primaryKey, composerSession.generationParameters[primaryKey], {
+      showAutomatic: true,
+      fallbackLabel: "画幅与分辨率"
+    });
+    elements.composerVideoDurationField.hidden = true;
+    renderGenerationParameterField(elements.composerImageQualityField, elements.composerImageQuality, capability, secondaryKey, composerSession.generationParameters[secondaryKey], {
+      fallbackLabel: "质量"
+    });
+    elements.composerImageReferenceModeField.hidden = composerSession.outputMode !== "create_image"
+      || !composerSession.referenceSnapshots.some((item) => item.imageRefs?.length);
+    elements.composerImageReferenceMode.value = composerSession.imageReferenceMode;
+    elements.composerImageReferenceMode.disabled = Boolean(activeOperation);
+  }
+  const messages = [
+    ...state.issues,
+    ...(!videoTask && composerSession.referenceSnapshots.some((item) => item.imageRefs?.length)
+      ? [t("参考图画幅无需与输出画幅一致。")]
+      : []),
+    ...(state.ignored.length ? [t("当前服务不会发送：{items}", { items: state.ignored.map(translateUiMessage).join(currentLocale() === "en" ? ", " : "、") })] : [])
+  ];
+  elements.composerGenerationParameterNote.textContent = messages.map(translateUiMessage).join(currentLocale() === "en" ? "; " : "；");
+  elements.composerGenerationParameterNote.classList.toggle("error", state.issues.length > 0);
+}
+
+async function updateImageReferenceMode() {
+  if (!composerSession || activeOperation || composerSession.outputMode !== "create_image") return;
+  const mode = elements.composerImageReferenceMode.value;
+  composerSession = await saveSession(createComposerSession({ ...composerSession, imageReferenceMode: mode }));
+  renderComposer();
+}
+
+async function updateReferenceInputs() {
+  if (!composerSession || activeOperation) return;
+  composerSession = await saveSession(createComposerSession({ ...composerSession,
+    imageReferenceMode: elements.composerSendImages.checked
+      ? (composerSession.imageReferenceMode === "prompt_only" ? "prompt_only" : "conditioned") : "text_only",
+    videoReferenceMode: elements.composerSendVideos.checked ? "original" : "text_only"
+  }));
+  renderComposer();
+}
+
+function generationParameterKey(capability, preferredKeys) {
+  return preferredKeys.find((key) => capability.parameters.some((item) => item.key === key)) ?? preferredKeys[0];
+}
+
+function renderGenerationParameterField(field, select, capability, key, selectedValue, { showAutomatic = false, fallbackLabel = "" } = {}) {
+  const parameter = capability.parameters.find((item) => item.key === key);
+  field.dataset.parameterKey = key;
+  const label = field.querySelector("span");
+  if (label) label.textContent = translateUiMessage(parameter?.label || fallbackLabel);
+  field.hidden = !parameter && !showAutomatic;
+  const supportedOptions = parameter?.options?.length
+    ? parameter.options
+    : showAutomatic ? [{ value: "", label: "由服务决定" }] : [];
+  const selected = String(selectedValue ?? "").trim();
+  const selectedSupported = supportedOptions.some((item) => item.value === selected);
+  const options = parameter && selected && !selectedSupported
+    ? [{ value: selected, label: t("{value}（当前模型不支持，请重选）", { value: selected }), incompatible: true }, ...supportedOptions]
+    : supportedOptions;
+  select.replaceChildren(...options.map((item) => {
+    const option = document.createElement("option");
+    option.value = item.value;
+    option.textContent = translateUiMessage(item.label);
+    option.dataset.incompatible = String(item.incompatible === true);
+    return option;
+  }));
+  if (parameter) select.value = selected || parameter.defaultValue;
+  select.disabled = Boolean(activeOperation) || options.length <= 1;
+  field.classList.toggle("is-readonly", options.length <= 1);
+}
+
+async function updateComposerAiProfile(change) {
+  if (!composerSession || activeOperation) return;
+  const generationMode = ["create_image", "create_video"].includes(composerSession.outputMode);
+  const baseProfile = generationMode ? composerSession.generationAiProfile : composerSession.aiProfile;
+  const aiProfile = normalizeComposerAiProfile({ ...baseProfile, ...change });
+  const service = selectedComposerService(aiProfile, composerAiSettings, composerVisionSettings);
+  const videoTask = composerSession.targetType === "video";
+  const generationParameters = generationMode
+    ? {
+        ...composerSession.generationParameters,
+        ...(videoTask
+          ? normalizeVideoGenerationRequest(aiProfile, composerVisionSettings, composerSession.generationParameters).parameters
+          : normalizeImageGenerationRequest(aiProfile, composerVisionSettings, composerSession.generationParameters).parameters)
+      }
+    : composerSession.generationParameters;
+  const activeGenerationMode = videoTask ? "create_video" : "create_image";
+  const serviceSupportsGeneration = videoTask ? service.videoGeneration : service.imageGeneration;
+  composerSession = createComposerSession({
+    ...composerSession,
+    ...(generationMode ? { generationAiProfile: aiProfile } : { aiProfile }),
+    generationParameters,
+    outputMode: composerSession.outputMode === activeGenerationMode && serviceSupportsGeneration
+      ? activeGenerationMode
+      : "text_prompt"
+  });
+  composerSession = await saveSession(composerSession);
+  closeComposerModelMenu();
+  renderComposer();
+}
+
+async function updateComposerOutputMode() {
+  if (!composerSession || activeOperation) return;
+  const videoTask = composerSession.targetType === "video";
+  const enabled = elements.composerCreateImage.checked;
+  const aiProfile = enabled ? generationRouteProfile(videoTask) : composerSession.generationAiProfile;
+  const service = selectedComposerService(aiProfile, composerAiSettings, composerVisionSettings);
+  const mediaAvailability = videoTask
+    ? composerVideoAvailability(aiProfile, composerVisionSettings, { ...composerSession, aiProfile })
+    : composerImageAvailability(aiProfile, composerVisionSettings, { ...composerSession, aiProfile });
+  const serviceSupportsGeneration = videoTask ? service.videoGeneration : service.imageGeneration;
+  if (enabled && (!serviceSupportsGeneration || !mediaAvailability.available)) {
+    renderComposerAiProfile();
+    return composerFeedback(mediaAvailability.message, true);
+  }
+  const parameterState = videoTask
+    ? normalizeVideoGenerationRequest(aiProfile, composerVisionSettings, composerSession.generationParameters)
+    : normalizeImageGenerationRequest(aiProfile, composerVisionSettings, composerSession.generationParameters);
+  composerSession = await saveSession(createComposerSession({
+    ...composerSession,
+    generationAiProfile: aiProfile,
+    outputMode: enabled ? (videoTask ? "create_video" : "create_image") : "text_prompt",
+    generationParameters: enabled
+      ? parameterState.parameters
+      : composerSession.generationParameters
+  }));
+  renderComposer();
+}
+
+function generationRouteProfile(videoTask) {
+  const current = normalizeComposerAiProfile(composerSession.generationAiProfile);
+  const currentAvailability = videoTask
+    ? composerVideoAvailability(current, composerVisionSettings, composerSession)
+    : composerImageAvailability(current, composerVisionSettings, composerSession);
+  if (currentAvailability.available) return current;
+  return composerProfileForTaskAssignment(
+    composerAiTaskAssignments[videoTask ? "videoGeneration" : "imageGeneration"],
+    current
+  );
+}
+
+function activeComposerProfile() {
+  return normalizeComposerAiProfile(["create_image", "create_video"].includes(composerSession?.outputMode)
+    ? composerSession?.generationAiProfile
+    : composerSession?.aiProfile);
+}
+
+async function updateImageGenerationParameters() {
+  if (!composerSession || activeOperation) return;
+  const videoTask = composerSession.targetType === "video";
+  if (videoTask && composerSession.outputMode !== "create_video") return;
+  const generationParameters = videoTask
+    ? {
+        ...composerSession.generationParameters,
+        size: elements.composerImageSize.value,
+        duration: elements.composerVideoDuration.value
+      }
+    : {
+        ...composerSession.generationParameters,
+        size: "",
+        aspectRatio: "",
+        quality: "",
+        imageSize: "",
+        [elements.composerImageSizeField.dataset.parameterKey || "size"]: elements.composerImageSize.value,
+        [elements.composerImageQualityField.dataset.parameterKey || "quality"]: elements.composerImageQuality.value
+      };
+  composerSession = await saveSession(createComposerSession({
+    ...composerSession,
+    generationParameters
+  }));
+  renderComposer();
+}
+
+async function updateComposerPreferences() {
+  if (!composerSession) return;
+  if (activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession.id) {
+    renderComposer();
+    return composerFeedback(t("生成期间不能修改当前对话设置"), true);
+  }
+  const previousType = composerSession.targetType;
+  const previousReviewEnabled = composerSession.productionReviewEnabled;
+  const targetType = selectedTargetType();
+  const previousDefault = previousType === "video" ? t("未命名视频提示词") : t("未命名图片提示词");
+  const nextTitle = composerSession.title === previousDefault
+    ? (targetType === "video" ? t("未命名视频提示词") : t("未命名图片提示词"))
+    : composerSession.title;
+  const keepExecution = previousType === targetType
+    && previousReviewEnabled === elements.composerProductionReview.checked;
+  composerSession = createComposerSession({
+    ...composerSession,
+    title: nextTitle,
+    targetType,
+    productionReviewEnabled: elements.composerProductionReview.checked,
+    currentInstruction: keepExecution ? composerSession.currentInstruction : "",
+    retrievedSources: keepExecution ? composerSession.retrievedSources : [],
+    currentRoute: keepExecution ? composerSession.currentRoute : "",
+    currentRouteSource: keepExecution ? composerSession.currentRouteSource : ""
+  });
+  const response = await chrome.runtime.sendMessage({
+    type: "UPDATE_COMPOSER_SETTINGS",
+    action: "preferences",
+    productionReviewEnabled: composerSession.productionReviewEnabled
+  });
+  if (response?.ok) composerSettings = normalizeComposerSettings(response.composerSettings);
+  composerSession = await saveSession(composerSession);
+  renderComposer();
+}
+
+async function loadComposerSession(sessionId) {
+  if (!sessionId || sessionId === composerSession?.id) return;
+  const response = await chrome.runtime.sendMessage({ type: "GET_COMPOSER_SESSION", sessionId });
+  if (!response?.ok) return composerFeedback(response?.message || t("没有找到这份创作草稿"), true);
+  composerSession = response.session;
+  if (composerSession.assistantState && !currentComposerOperation()) elements.composerInstruction.value = composerSession.currentInstruction || '';
+  replaceComposerSessionUrl(sessionId);
+  elements.composerShell.classList.remove("nav-open");
+  closeReferenceWorkspace();
+  renderComposer();
+}
+
+async function deleteSession(sessionId) {
+  if (activeOperation?.kind === "compose" && activeOperation.sessionId === sessionId) {
+    return composerFeedback(t("请先停止这个对话的生成，再删除"), true);
+  }
+  const summary = sessionSummaries.find((item) => item.id === sessionId);
+  if (!await confirmAppAction({ title: t("删除这段对话？"), description: translateUiMessage(summary?.title || composerSession?.title || ""), confirmLabel: t("删除"), danger: true })) return;
+  const response = await chrome.runtime.sendMessage({ type: "DELETE_COMPOSER_SESSION", sessionId });
+  if (!response?.ok) return composerFeedback(response?.message || t("无法删除创作草稿"), true);
+  sessionSummaries = response.summaries ?? [];
+  if (composerSession?.id === sessionId) {
+    const next = sessionSummaries[0];
+    if (next) await loadComposerSession(next.id);
+    else await createNewSession();
+  }
+  else renderSessions();
+}
+
+function renderComposerSaveState() {
+  if (!isMeaningfulComposerSession(composerSession)) {
+    elements.composerSaveState.textContent = t("新对话");
+    return;
+  }
+  if (composerSession.lastFailure?.phase === "saving") {
+    elements.composerSaveState.textContent = t("保存失败");
+    return;
+  }
+  elements.composerSaveState.textContent = sessionSummaries.some((summary) => summary.id === composerSession.id)
+    ? t("已自动保存")
+    : t("正在保存…");
+}
+
+async function saveSession(session) {
+  const current = composerSession?.id === session.id;
+  if (!isMeaningfulComposerSession(session)) {
+    if (current) elements.composerSaveState.textContent = t("新对话");
+    return createComposerSession(session);
+  }
+  if (current) elements.composerSaveState.textContent = t("正在保存…");
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "UPSERT_COMPOSER_SESSION", session });
+    if (!response?.ok) throw new Error(response?.message || t("无法保存创作草稿"));
+    sessionSummaries = response.summaries ?? sessionSummaries;
+    if (composerSession?.id === response.session.id) composerSession = response.session;
+    if (current) {
+      elements.composerSaveState.textContent = t("已自动保存");
+      replaceComposerSessionUrl(response.session.id);
+    }
+    return response.session;
+  } catch (error) {
+    if (current) elements.composerSaveState.textContent = t("保存失败");
+    throw error;
+  }
+}
+
+function replaceComposerSessionUrl(sessionId) {
+  history.replaceState(null, "", `composer.html?session=${encodeURIComponent(sessionId)}`);
+}
+
+function openReferenceWorkspace({ entryId = "" } = {}) {
+  if (referenceFocusedEntryId && !entryId) elements.composerReferenceSearch.value = "";
+  referenceFocusedEntryId = entryId;
+  if (entryId) {
+    elements.composerReferenceSearch.value = entries.find((entry) => entry.id === entryId)?.title || "";
+    elements.composerReferenceProjectFilter.value = "";
+    initialProjectFilterId = "";
+  }
+  clearComposerFeedback();
+  referenceDraftSelections = new Map();
+  referenceDraftOrder = [];
+  referenceDraftSourceSelections = new Map();
+  referencePreviewAssetIds = new Map();
+  for (const item of (composerSession?.referenceSnapshots ?? []).filter((reference) => reference.sourceType !== TEMP_REFERENCE_SOURCE_TYPES.temporary)) {
+    const assetIds = [item.assetId, ...(item.imageRefs ?? []).map((imageRef) => imageRef.visualId)].filter(Boolean);
+    const selected = referenceDraftSelections.get(item.entryId) ?? new Set();
+    assetIds.forEach((assetId) => selected.add(assetId));
+    referenceDraftSelections.set(item.entryId, selected);
+    if (assetIds.length) assetIds.forEach((assetId) => addDraftOrder(item.entryId, assetId));
+    else addDraftOrder(item.entryId, "");
+    if (assetIds[0]) referencePreviewAssetIds.set(item.entryId, assetIds[0]);
+    if (item.assetId && item.referenceSources?.length) {
+      referenceDraftSourceSelections.set(draftOrderKey(item.entryId, item.assetId), new Set(item.referenceSources.map((source) => source.id)));
+    }
+  }
+  elements.composerReferenceWorkspace.hidden = false;
+  elements.composerReferenceWorkspace.inert = false;
+  elements.composerReferenceWorkspace.setAttribute("aria-hidden", "false");
+  setReferenceWorkspaceMode("references");
+  elements.composerReferenceSearch.focus();
+}
+
+function openSkillWorkspace() {
+  clearComposerFeedback();
+  elements.composerReferenceWorkspace.hidden = false;
+  elements.composerReferenceWorkspace.inert = false;
+  elements.composerReferenceWorkspace.setAttribute("aria-hidden", "false");
+  setReferenceWorkspaceMode("skills");
+}
+
+function setReferenceWorkspaceMode(mode) {
+  workspaceMode = mode === "skills" ? "skills" : "references";
+  elements.composerReferenceWorkspace.dataset.mode = workspaceMode;
+  renderReferencePicker();
+}
+
+function closeReferenceWorkspace() {
+  if (elements.composerReferenceWorkspace.contains(document.activeElement)) {
+    elements.composerReferenceOpen.focus({ preventScroll: true });
+  }
+  referenceCaseWindow.suspend();
+  elements.composerReferenceWorkspace.inert = true;
+  elements.composerReferenceWorkspace.setAttribute("aria-hidden", "true");
+  elements.composerReferenceWorkspace.hidden = true;
+  clearComposerFeedback();
+}
+
+function renderReferencePicker() {
+  const referencesMode = workspaceMode === "references";
+  elements.composerProjectsPanel.hidden = referencesMode;
+  elements.composerCasePicker.hidden = !referencesMode;
+  elements.composerReferenceFooter.hidden = !referencesMode;
+  elements.composerReferenceTabCases.setAttribute("aria-pressed", String(referencesMode));
+  elements.composerReferenceTabSkills.setAttribute("aria-pressed", String(!referencesMode));
+  elements.composerWorkspaceTitle.textContent = t("本次参考");
+  elements.composerWorkspaceDescription.textContent = referencesMode
+    ? t("只选择本次对话需要借鉴的案例。")
+    : t("可同时应用多个 Skill；列表顺序就是本轮装配顺序。");
+  if (referencesMode) {
+    renderProjectFilter();
+    renderCasePicker();
+    renderReferenceSelection();
+  } else { referenceCaseWindow.suspend(); renderSkills(); }
+}
+
+function renderProjectFilter() {
+  const selected = elements.composerReferenceProjectFilter.value || initialProjectFilterId;
+  const selectorLabelsByProject = collectionSelectorLabelsById(organizerState);
+  const options = [["", t("全部项目")], ...(organizerState.collections ?? []).map((item) => [item.id, selectorLabelsByProject.get(item.id)])];
+  elements.composerReferenceProjectFilter.replaceChildren(...options.map(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    return option;
+  }));
+  elements.composerReferenceProjectFilter.value = options.some(([value]) => value === selected) ? selected : "";
+  initialProjectFilterId = "";
+}
+
+function renderSkills() {
+  for (const host of elements.composerProjectList.querySelectorAll(".skill-cover-card")) clearSkillCoverImage(host);
+  const skills = creativeSkills.items;
+  if (!skills.length) {
+    const empty = el("div", "composer-reference-empty");
+    const open = textEl("button", "button-secondary", "打开 Skill 中心");
+    open.addEventListener("click", () => safely(openSkillCenter)());
+    empty.append(
+      rawTextEl("p", "", t("还没有已保存的创作 Skill。")),
+      open
+    );
+    elements.composerProjectList.replaceChildren(empty);
+    return;
+  }
+  const applied = new Set(composerSession.appliedSkills.map((item) => item.skillId));
+  const cards = skills.map((skill) => {
+    const card = el("article", "ui-skill-card composer-skill-card");
+    const header = el("header", "");
+    const title = el("div", "");
+    title.append(rawTextEl("h2", "ui-skill-card-title", skill.callName), rawTextEl("code", "", `/${skill.callName}`));
+    header.append(title, rawTextEl("small", "", `v${skill.versions.findIndex((item) => item.id === skill.currentVersionId) + 1}`));
+    const cover = el("div", "skill-cover-card");
+    showSkillCoverImage(cover, () => readSkillCover(skill, getMediaBlob), { alt: skill.callName });
+    card.append(cover, header, rawTextEl("p", "ui-skill-card-summary composer-project-state", skill.description || t("暂无说明")));
+    const actions = el("div", "ui-skill-card-actions");
+    const edit = textEl("button", "button-secondary", "查看与编辑");
+    edit.addEventListener("click", () => safely(() => openSkillCenter(skill.id))());
+    const apply = textEl("button", applied.has(skill.id) ? "composer-project-active" : "", applied.has(skill.id) ? "已应用" : "应用 Skill");
+    apply.disabled = activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession?.id;
+    apply.addEventListener("click", () => safely(() => applied.has(skill.id) ? removeAppliedSkill(skill.id) : applyCreativeSkill(skill))());
+    actions.append(edit, apply);
+    card.append(actions);
+    return card;
+  });
+  elements.composerProjectList.replaceChildren(...cards);
+}
+
+function renderCasePicker() {
+  const query = elements.composerReferenceSearch.value.trim().toLocaleLowerCase();
+  const projectId = elements.composerReferenceProjectFilter.value;
+  const projectIds = projectId
+    ? new Set(collectionEntryIds(organizerState, projectId, { subtree: true }))
+    : null;
+  const eligible = entries.filter((entry) => {
+    if (referenceFocusedEntryId) return entry.id === referenceFocusedEntryId;
+    if (projectIds && !(entry.memberEntryIds ? entry.memberEntryIds.some((id) => projectIds.has(id)) : projectIds.has(entry.id))) return false;
+    if (!query) return true;
+    return `${entry.title ?? ""}\n${entry.text ?? ""}\n${primaryVisionDescription(entry)}\n${composerDocumentTextByEntryId.get(entry.id) || ""}`.toLocaleLowerCase().includes(query);
+  });
+  if (!eligible.length) {
+    referenceCaseWindow.suspend();
+    elements.composerCaseList.replaceChildren(rawTextEl("p", "composer-reference-empty", t("没有匹配的可用案例。")));
+    return;
+  }
+  referenceCaseWindow.set(eligible);
+}
+
+function createCaseOption(entry) {
+  const option = el("article", "composer-case-option");
+  const selectable = isComposerEligibleEntry(entry, composerSession?.targetType, { documentTextByEntryId: composerDocumentTextByEntryId });
+  option.dataset.entryId = entry.id;
+  const referenceAssets = selectableReferenceAssets(entry, composerSession?.targetType);
+  const primaryAsset = referenceAssets.find((asset) => asset.id === entry.primaryMediaId) ?? referenceAssets[0];
+  const selectedPreviewAsset = referenceAssets.find((asset) => asset.id === referencePreviewAssetIds.get(entry.id)) ?? primaryAsset;
+  const previewAsset = selectedPreviewAsset ?? previewReferenceAsset(entry);
+  if (selectedPreviewAsset) referencePreviewAssetIds.set(entry.id, selectedPreviewAsset.id);
+  else referencePreviewAssetIds.delete(entry.id);
+  option.dataset.selected = String(referenceDraftSelections.has(entry.id));
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.className = "composer-case-preview-checkbox";
+  checkbox.disabled = !selectable;
+  checkbox.setAttribute("aria-label", t("选择当前预览素材：{title}", { title: entry.title || t("未命名案例") }));
+  checkbox.checked = selectedPreviewAsset ? referenceDraftSelections.get(entry.id)?.has(selectedPreviewAsset.id) === true : referenceDraftSelections.has(entry.id);
+  checkbox.addEventListener("change", () => {
+    const assetId = referencePreviewAssetIds.get(entry.id);
+    setDraftAssetSelected(entry.id, assetId || "", checkbox.checked);
+    const asset = referenceAssets.find((item) => item.id === assetId);
+    if (asset?.kind === "video") referenceCaseWindow.refresh(entry.id);
+    else syncCaseOptionSelection(option, entry);
+    renderReferenceSelection();
+  });
+  const visual = el("div", "composer-case-visual");
+  const selectPreview = el("button", "composer-case-select-preview");
+  selectPreview.type = "button";
+  selectPreview.disabled = !selectable;
+  selectPreview.setAttribute("aria-label", t("选择或取消当前预览素材"));
+  selectPreview.addEventListener("click", () => {
+    const assetId = referencePreviewAssetIds.get(entry.id);
+    const selected = assetId ? referenceDraftSelections.get(entry.id)?.has(assetId) === true : referenceDraftSelections.has(entry.id);
+    setDraftAssetSelected(entry.id, assetId || "", !selected);
+    const asset = referenceAssets.find((item) => item.id === assetId);
+    if (asset?.kind === "video") referenceCaseWindow.refresh(entry.id);
+    else syncCaseOptionSelection(option, entry);
+    renderReferenceSelection();
+  });
+  const inspect = textEl("button", "composer-case-inspect", previewAsset?.kind === "video" ? "播放视频" : "查看原图");
+  inspect.type = "button";
+  if (previewAsset?.kind === "video") {
+    inspect.classList.add("icon-button");
+    inspect.setAttribute("aria-label", t("播放视频"));
+    inspect.title = t("播放视频");
+    setUiIcon(inspect, "play");
+  }
+  inspect.hidden = !previewAsset;
+  inspect.disabled = false;
+  inspect.addEventListener("click", () => openReferenceAssetPreview(entry, referencePreviewAssetIds.get(entry.id) || previewAsset?.id));
+  visual.append(selectPreview, inspect);
+  option.append(checkbox, visual);
+  renderCasePreviewImage(option, entry, previewAsset?.id || "");
+  const copy = el("span", "composer-case-copy");
+  const contentRole = contentRoleForEntry(entry);
+  const type = contentRole === CONTENT_ROLES.promptVideo
+    ? t("视频提示词")
+    : contentRole === CONTENT_ROLES.imageCase ? t("画面描述") : contentRole === CONTENT_ROLES.promptImage ? t("图片提示词") : t("文字资料");
+  const preview = entry.text || composerDocumentTextByEntryId.get(entry.id) || primaryVisionDescription(entry);
+  copy.append(rawTextEl("strong", "", entry.title || t("未命名案例")), rawTextEl("small", "", type), rawTextEl("p", "", excerpt(preview, 240)));
+  option.append(copy);
+  if (!selectable) copy.append(rawTextEl("small", "", t("暂无可读取的正文或当前支持的素材")));
+  if (referenceAssets.length > 1) {
+    const assetPicker = el("div", "composer-case-assets");
+    assetPicker.setAttribute("aria-label", t("{title}的素材", { title: entry.title || t("未命名案例") }));
+    for (const [index, asset] of referenceAssets.entries()) {
+      const assetOption = el("label", "composer-case-asset");
+      assetOption.dataset.assetId = asset.id;
+      const assetCheckbox = document.createElement("input");
+      assetCheckbox.type = "checkbox";
+      assetCheckbox.checked = referenceDraftSelections.get(entry.id)?.has(asset.id) === true;
+      assetCheckbox.setAttribute("aria-label", asset.kind === "image"
+        ? t("选择第 {number} 张图片", { number: index + 1 })
+        : t("选择第 {number} 支视频", { number: index + 1 }));
+      const displayAsset = asset.kind === "video" ? posterAssetForVideo(entry, asset) : asset;
+      const thumbnail = displayAsset ? document.createElement("img") : rawTextEl("span", "", t("视频"));
+      if (displayAsset) {
+        thumbnail.alt = "";
+        thumbnail.loading = "lazy";
+        thumbnail.decoding = "async";
+        thumbnail.dataset.visualId = displayAsset.id;
+        const cached = thumbnailUrls.get(displayAsset.id);
+        if (cached) thumbnail.src = cached;
+        else imageObserver.observe(thumbnail);
+      }
+      assetCheckbox.addEventListener("change", () => {
+        referencePreviewAssetIds.set(entry.id, asset.id);
+        setDraftAssetSelected(entry.id, asset.id, assetCheckbox.checked);
+        if (asset.kind === "video") referenceCaseWindow.refresh(entry.id);
+        else {
+          renderCasePreviewImage(option, entry, asset.id);
+          syncCaseOptionSelection(option, entry);
+        }
+        renderReferenceSelection();
+      });
+      assetOption.append(assetCheckbox, thumbnail, rawTextEl("span", "", asset.kind === "video" ? t("视频") : String(index + 1)));
+      assetPicker.append(assetOption);
+    }
+    option.append(assetPicker);
+  }
+  const sourceOptions = referenceAssets.flatMap((asset) => asset.kind === "video" && referenceDraftSelections.get(entry.id)?.has(asset.id)
+    ? composerVideoSourceOptions(entry, asset) : []);
+  if (sourceOptions.length) {
+    const sourcePicker = el("div", "composer-case-assets");
+    sourcePicker.setAttribute("aria-label", t("{title}的视频文字来源", { title: entry.title || t("未命名案例") }));
+    sourcePicker.append(...sourceOptions);
+    option.append(sourcePicker);
+  }
+  return option;
+}
+
+function composerVideoSourceOptions(entry, asset) {
+  const key = draftOrderKey(entry.id, asset.id);
+  const analysisIds = (entry.videoAnalyses ?? [])
+    .filter((analysis) => String(analysis?.assetId ?? "") === asset.id)
+    .map((analysis) => String(analysis?.id ?? "")).filter(Boolean);
+  const parts = referenceSourcePartsForAsset(entry, asset.id, { analysisIds });
+  const defaultPartIds = new Set(referenceSourcePartsForAsset(entry, asset.id).map((source) => source.id));
+  let selected = referenceDraftSourceSelections.get(key);
+  if (!selected) {
+    selected = defaultPartIds;
+    referenceDraftSourceSelections.set(key, selected);
+  }
+  return parts.map((part) => {
+    const option = el("label", "composer-case-asset");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = selected.has(part.id);
+    const short = part.kind === "original_prompt" && [...part.text.replace(/\s+/g, "")].length <= 3;
+    const labelText = part.kind === "other_analysis"
+      ? `${part.label} · ${excerpt(part.text, 24)}`
+      : short ? `${part.label} · ${t("短内容")}` : part.label;
+    const label = rawTextEl("span", "", labelText);
+    input.addEventListener("change", () => {
+      input.checked ? selected.add(part.id) : selected.delete(part.id);
+      referenceCaseWindow.refresh(entry.id);
+      renderReferenceSelection();
+    });
+    option.dataset.assetId = asset.id;
+    option.title = part.text;
+    option.append(input, label);
+    return option;
+  });
+}
+
+function setDraftAssetSelected(entryId, assetId, selected) {
+  if (!entryId) return;
+  if (!assetId) {
+    if (selected) {
+      referenceDraftSelections.set(entryId, new Set());
+      addDraftOrder(entryId);
+    } else removeDraftEntry(entryId);
+    return;
+  }
+  const selection = referenceDraftSelections.get(entryId) ?? new Set();
+  if (selected) {
+    selection.add(assetId);
+    referenceDraftSelections.set(entryId, selection);
+    addDraftOrder(entryId, assetId);
+    const entry = entries.find((item) => item.id === entryId);
+    const asset = selectableReferenceAssets(entry, composerSession?.targetType).find((item) => item.id === assetId);
+    if (asset?.kind === "video") {
+      referenceDraftSourceSelections.set(draftOrderKey(entryId, assetId), new Set(referenceSourcePartsForAsset(entry, assetId).map((source) => source.id)));
+    }
+    return;
+  }
+  selection.delete(assetId);
+  removeDraftOrder(entryId, assetId);
+  referenceDraftSourceSelections.delete(draftOrderKey(entryId, assetId));
+  if (!selection.size) referenceDraftSelections.delete(entryId);
+}
+
+function renderCasePreviewImage(option, entry, assetId) {
+  const surface = option.querySelector(".composer-case-select-preview");
+  if (!surface) return;
+  const asset = previewReferenceAsset(entry, assetId);
+  if (!asset) return surface.replaceChildren(rawTextEl("span", "", t("文字资料")));
+  surface.releaseVideo?.();
+  surface.releaseVideo = null;
+  if (asset.kind === "video") {
+    const cover = el("span", "composer-video-cover");
+    surface.replaceChildren(cover);
+    const releaseCover = bindSourceVideoCover(cover, entry, asset, null);
+    const hover = asset.storageMode !== "reference"
+      ? bindVideoHoverPreview(surface, { loadBlob: () => getMediaBlob(asset.id) }) : null;
+    surface.releaseVideo = () => { releaseCover(); hover?.destroy(); };
+    return;
+  }
+  const displayAsset = asset;
+  if (!displayAsset) return surface.replaceChildren(rawTextEl("span", "", t("视频")));
+  const image = document.createElement("img");
+  image.className = "composer-case-image";
+  image.alt = t("{title} 对应画面", { title: entry.title || t("未命名案例") });
+  image.loading = "lazy";
+  image.decoding = "async";
+  image.dataset.visualId = displayAsset.id;
+  const cached = thumbnailUrls.get(displayAsset.id);
+  if (cached) image.src = cached;
+  else imageObserver.observe(image);
+  surface.replaceChildren(image);
+}
+
+function syncCaseOptionSelection(option, entry) {
+  const selected = referenceDraftSelections.get(entry.id) ?? new Set();
+  const previewAssetId = referencePreviewAssetIds.get(entry.id) || "";
+  option.dataset.selected = String(referenceDraftSelections.has(entry.id));
+  const previewCheckbox = option.querySelector(".composer-case-preview-checkbox");
+  if (previewCheckbox) previewCheckbox.checked = previewAssetId ? selected.has(previewAssetId) : referenceDraftSelections.has(entry.id);
+  for (const input of option.querySelectorAll(".composer-case-asset input[type='checkbox']")) {
+    input.checked = selected.has(input.closest(".composer-case-asset")?.dataset.assetId || "");
+  }
+}
+
+function syncRenderedReferenceCards() {
+  for (const option of elements.composerCaseList.querySelectorAll(".composer-case-option[data-entry-id]")) {
+    const entry = entries.find((item) => item.id === option.dataset.entryId);
+    if (entry) syncCaseOptionSelection(option, entry);
+  }
+}
+
+async function openReferenceAssetPreview(entry, assetId) {
+  if (!assetId) return;
+  try {
+    const asset = previewReferenceAsset(entry, assetId);
+    if (asset?.kind === "video") {
+      const dialog = el("dialog", "composer-reference-preview-dialog");
+      const close = textEl("button", "icon-button", "×");
+      close.type = "button";
+      close.setAttribute("aria-label", t("关闭视频预览"));
+      const player = createSourceVideoPreview(entry, asset);
+      dialog.append(close, player);
+      close.addEventListener("click", () => dialog.close());
+      dialog.addEventListener("close", () => { player.releaseMedia(); dialog.remove(); }, { once: true });
+      document.body.append(dialog);
+      dialog.showModal();
+      player.querySelector("button").click();
+      return;
+    }
+    const displayAsset = asset;
+    const blob = displayAsset ? await getScreenshotBlob(displayAsset.id) : null;
+    if (!blob) throw new Error("无法读取原图");
+    const url = URL.createObjectURL(blob);
+    const dialog = el("dialog", "composer-reference-preview-dialog");
+    const close = textEl("button", "icon-button", "×");
+    close.type = "button";
+    close.setAttribute("aria-label", t("关闭原图预览"));
+    const image = document.createElement("img");
+    image.src = url;
+    image.alt = t("{title} 原图", { title: entry.title || t("未命名案例") });
+    dialog.append(close, image);
+    const dispose = () => {
+      URL.revokeObjectURL(url);
+      dialog.remove();
+    };
+    close.addEventListener("click", () => dialog.close());
+    dialog.addEventListener("close", dispose, { once: true });
+    document.body.append(dialog);
+    dialog.showModal();
+  } catch (error) {
+    setReferenceFeedback(error.message || "无法查看原图", true);
+  }
+}
+
+// Viewing a case is independent of which assets the current creative task can use.
+function previewReferenceAsset(entry, assetId = "") {
+  const assets = entryMediaAssets(entry).filter(asset => asset.usage !== "poster" && ["image", "video"].includes(asset.kind));
+  return assets.find(asset => asset.id === assetId)
+    ?? assets.find(asset => asset.id === entry.primaryMediaId) ?? assets[0];
+}
+
+function selectableReferenceAssets(entry, targetType = "") {
+  return entryMediaAssets(entry).filter((asset) => asset.usage !== "poster" &&
+    (asset.kind === "image" || targetType === "video" && asset.kind === "video"));
+}
+
+function draftOrderKey(entryId, assetId = "") {
+  return `${entryId}\u0000${assetId}`;
+}
+
+function addDraftOrder(entryId, assetId = "") {
+  const key = draftOrderKey(entryId, assetId);
+  if (!referenceDraftOrder.includes(key)) referenceDraftOrder.push(key);
+}
+
+function removeDraftOrder(entryId, assetId = "") {
+  const key = draftOrderKey(entryId, assetId);
+  referenceDraftOrder = referenceDraftOrder.filter((item) => item !== key);
+}
+
+function removeDraftEntry(entryId) {
+  referenceDraftSelections.delete(entryId);
+  referenceDraftOrder = referenceDraftOrder.filter((item) => !item.startsWith(`${entryId}\u0000`));
+  for (const key of referenceDraftSourceSelections.keys()) {
+    if (key.startsWith(`${entryId}\u0000`)) referenceDraftSourceSelections.delete(key);
+  }
+}
+
+function orderedDraftItems() {
+  const items = [];
+  for (const [entryId, assetIds] of referenceDraftSelections) {
+    if (assetIds.size) assetIds.forEach((assetId) => items.push({ entryId, assetId, key: draftOrderKey(entryId, assetId) }));
+    else items.push({ entryId, assetId: "", key: draftOrderKey(entryId, "") });
+  }
+  const order = new Map(referenceDraftOrder.map((key, index) => [key, index]));
+  return items.sort((left, right) => (order.get(left.key) ?? Number.MAX_SAFE_INTEGER) - (order.get(right.key) ?? Number.MAX_SAFE_INTEGER));
+}
+
+async function hydrateCaseImage(image) {
+  const visualId = image.dataset.visualId;
+  if (!visualId || image.src) return;
+  try {
+    const derived = image.dataset.thumbnailKey ? await getDerivedMedia(visualId) : null;
+    const blob = derived?.thumbnail instanceof Blob ? derived.thumbnail : await getScreenshotBlob(visualId);
+    if (!blob || !image.isConnected) return;
+    const key = image.dataset.thumbnailKey || visualId;
+    const url = thumbnailUrls.get(key) || URL.createObjectURL(blob);
+    thumbnailUrls.set(key, url);
+    image.src = url;
+  } catch {
+    image.closest(".composer-case-select-preview")?.replaceChildren(rawTextEl("span", "", t("截图读取失败")));
+  }
+}
+
+function renderReferenceSelection() {
+  const selectedItems = orderedDraftItems();
+  const limit = draftReferenceLimitState(selectedItems);
+  elements.composerCaseSelectionCount.textContent = t("已选择 {count} 张/项参考", { count: selectedItems.length })
+    + (limit.maximum !== null ? t(" · 当前生图模型 {count}/{maximum}", { count: limit.imageCount, maximum: limit.maximum }) : "");
+  elements.composerReferenceApply.disabled = limit.exceeded;
+  if (limit.exceeded) {
+    elements.composerReferenceFeedback.textContent = t("所选模型最多接收 {maximum} 张参考图；当前 {count} 张。选择已保留，请减少后再应用。", { maximum: limit.maximum, count: limit.imageCount });
+    elements.composerReferenceFeedback.classList.add("error");
+  } else if (elements.composerReferenceFeedback.textContent.includes("最多接收")) {
+    elements.composerReferenceFeedback.textContent = "";
+    elements.composerReferenceFeedback.classList.remove("error");
+  }
+  elements.composerSelectionStrip.replaceChildren(...selectedItems.slice(0, 8).map((item, index) => {
+    const entry = entries.find((candidate) => candidate.id === item.entryId);
+    const assets = selectableReferenceAssets(entry, composerSession?.targetType);
+    const assetIndex = item.assetId ? assets.findIndex((asset) => asset.id === item.assetId) : -1;
+    const asset = assetIndex >= 0 ? assets[assetIndex] : null;
+    const chip = el("span", "composer-selection-chip");
+    chip.append(rawTextEl("b", "", `${entry?.title || t("未命名案例")}${assetIndex >= 0 ? asset?.kind === "video" ? ` · ${t("视频")}` : t(" · 图{number}", { number: assetIndex + 1 }) : ""}`));
+    const moveLeft = textEl("button", "", "←");
+    moveLeft.type = "button";
+    moveLeft.disabled = index === 0;
+    moveLeft.setAttribute("aria-label", t("向前移动参考"));
+    moveLeft.addEventListener("click", () => moveDraftItem(item.key, -1));
+    const moveRight = textEl("button", "", "→");
+    moveRight.type = "button";
+    moveRight.disabled = index === selectedItems.length - 1;
+    moveRight.setAttribute("aria-label", t("向后移动参考"));
+    moveRight.addEventListener("click", () => moveDraftItem(item.key, 1));
+    const remove = textEl("button", "", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", t("移除参考"));
+    remove.addEventListener("click", () => {
+      const selection = referenceDraftSelections.get(item.entryId);
+      if (item.assetId) selection?.delete(item.assetId);
+      else referenceDraftSelections.delete(item.entryId);
+      if (selection && !selection.size) referenceDraftSelections.delete(item.entryId);
+      removeDraftOrder(item.entryId, item.assetId);
+      referenceDraftSourceSelections.delete(item.key);
+      syncRenderedReferenceCards();
+      renderReferenceSelection();
+    });
+    chip.append(moveLeft, moveRight, remove);
+    return chip;
+  }));
+  if (selectedItems.length > 8) elements.composerSelectionStrip.append(rawTextEl("span", "", `+${selectedItems.length - 8}`));
+}
+
+function draftReferenceLimitState(items = orderedDraftItems()) {
+  const imageCount = items.filter((item) => {
+    const entry = entries.find((candidate) => candidate.id === item.entryId);
+    return selectableReferenceAssets(entry, composerSession?.targetType).some((asset) => asset.id === item.assetId && asset.kind === "image");
+  }).length;
+  if (composerSession?.outputMode !== "create_image" || composerSession.imageReferenceMode !== "conditioned") {
+    return { imageCount, maximum: null, exceeded: false };
+  }
+  const capability = composerServiceCapabilities(composerSession.generationAiProfile, composerVisionSettings).image;
+  const maximum = Number.isInteger(capability?.references?.maxItems) ? capability.references.maxItems : null;
+  return { imageCount, maximum, exceeded: maximum !== null && imageCount > maximum };
+}
+
+function setReferenceFeedback(message, error = false) {
+  elements.composerReferenceFeedback.textContent = String(message ?? "");
+  elements.composerReferenceFeedback.classList.toggle("error", error);
+}
+
+function moveDraftItem(key, direction) {
+  const index = referenceDraftOrder.indexOf(key);
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= referenceDraftOrder.length) return;
+  [referenceDraftOrder[index], referenceDraftOrder[target]] = [referenceDraftOrder[target], referenceDraftOrder[index]];
+  renderReferenceSelection();
+}
+
+async function applySelectedReferences() {
+  if (!composerSession) return;
+  if (activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession.id) {
+    return composerFeedback(t("生成期间不能修改当前对话的参考资料"), true);
+  }
+  const temporaryReferences = composerSession.referenceSnapshots
+    .filter((item) => item.sourceType === TEMP_REFERENCE_SOURCE_TYPES.temporary);
+  const selected = orderedDraftItems();
+  const limit = draftReferenceLimitState(selected);
+  if (limit.exceeded) {
+    return setReferenceFeedback(t("所选模型最多接收 {maximum} 张参考图；当前 {count} 张。系统不会自动删图。", { maximum: limit.maximum, count: limit.imageCount }), true);
+  }
+  composerSession = createComposerSession({
+    ...composerSession,
+    referenceSnapshots: [
+      ...createReferenceSnapshots(entries, selected.map((item) => ({
+        entryId: item.entryId,
+        assetIds: item.assetId ? [item.assetId] : [],
+        sourceIds: item.assetId ? [...(referenceDraftSourceSelections.get(item.key) ?? [])] : null,
+        analysisIds: item.assetId
+          ? (entries.find((entry) => entry.id === item.entryId)?.videoAnalyses ?? [])
+              .filter((analysis) => referenceDraftSourceSelections.get(item.key)?.has(`analysis:${String(analysis?.id ?? "")}`))
+              .map((analysis) => String(analysis.id))
+          : []
+      })), currentLocale(), composerSession.targetType, { documentTextByEntryId: composerDocumentTextByEntryId }),
+      ...temporaryReferences
+    ],
+    currentInstruction: "",
+    retrievedSources: [],
+    currentRoute: "",
+    currentRouteSource: ""
+  });
+  composerSession = await saveSession(composerSession);
+  for (const entryId of referenceDraftSelections.keys()) {
+    const entry = entries.find((item) => item.id === entryId);
+    if (!entry?.creationMeta?.creativeRunId) continue;
+    const run = creativeRuns.find((item) => item.id === entry.creationMeta.creativeRunId);
+    const reusableIds = new Set(run?.outputs.map((output) => output.visual.id) ?? []);
+    for (const visualId of normalizeEntryVisualIds(entry).filter((id) => reusableIds.has(id))) {
+      const response = await chrome.runtime.sendMessage({
+        type: "RECORD_CREATIVE_SIGNAL",
+        runId: entry.creationMeta.creativeRunId,
+        visualId,
+        signalType: "reused_as_reference"
+      });
+      if (response?.ok) creativeRuns = response.creativeRuns ?? creativeRuns;
+    }
+  }
+  closeReferenceWorkspace();
+  renderComposer();
+  composerFeedback(t("参考资料已更新"));
+}
+
+async function applyCreativeSkill(skill) {
+  if (!composerSession) return;
+  if (activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession.id) {
+    return composerFeedback("生成期间不能修改当前对话的 Skill", true);
+  }
+  if (composerSession.appliedSkills.some((item) => item.skillId === skill.id)) return;
+  composerSession = createComposerSession({
+    ...composerSession,
+    appliedSkills: [...composerSession.appliedSkills, createAppliedSkillSnapshot(skill)],
+    currentInstruction: "",
+    retrievedSources: [],
+    currentRoute: "",
+    currentRouteSource: ""
+  });
+  composerSession = await saveSession(composerSession);
+  closeReferenceWorkspace();
+  renderComposer();
+  composerFeedback(t("已应用 Skill：/{name}", { name: skill.callName }));
+}
+
+async function removeAppliedSkill(skillId) {
+  if (!composerSession) return;
+  if (activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession.id) {
+    return composerFeedback("生成期间不能修改当前对话的 Skill", true);
+  }
+  composerSession = createComposerSession({ ...composerSession, appliedSkills: composerSession.appliedSkills.filter((item) => item.skillId !== skillId), currentInstruction: "", retrievedSources: [], currentRoute: "", currentRouteSource: "" });
+  composerSession = await saveSession(composerSession);
+  renderComposer();
+  if (!elements.composerReferenceWorkspace.hidden && workspaceMode === "skills") renderSkills();
+}
+
+async function openSkillCenter(skillId = "") {
+  const url = new URL(chrome.runtime.getURL("skills.html"));
+  url.searchParams.set("source", "composer");
+  if (composerSession?.id) url.searchParams.set("session", composerSession.id);
+  if (skillId) url.searchParams.set("skill", skillId);
+  location.assign(url.href);
+}
+
+function freezeComposerAssemblySnapshot(session, {
+  turnId,
+  userMessageId,
+  userRequest,
+  policy,
+  imageEdit = null,
+  prerequisiteAnalysisRequests = 0
+}) {
+  const payload = plannerRequestPayload(session, "", composerSettings);
+  const generationMode = ["create_image", "create_video"].includes(session.outputMode);
+  const profile = generationMode ? session.generationAiProfile : session.aiProfile;
+  const service = selectedComposerService(profile, composerAiSettings, composerVisionSettings);
+  const selectedImageCount = session.referenceSnapshots.reduce((total, reference) => total + reference.imageRefs.length, 0);
+  const selectedVideoCount = session.referenceSnapshots.reduce((total, reference) => total + (reference.assetRefs || []).filter(asset => asset.kind === "video").length, 0);
+  const canSendImages = session.imageReferenceMode !== "text_only";
+  const expectedSentImageCount = canSendImages ? selectedImageCount : 0;
+  const omittedImageCount = selectedImageCount - expectedSentImageCount;
+  const taskMethod = session.routeMode === "auto"
+    ? Object.entries(composerSettings.taskMethods)
+        .map(([taskKey, method]) => `${taskKey}\n${String(method?.text ?? "").trim()}`)
+        .filter((item) => item.trim())
+        .join("\n\n")
+    : payload.taskMethod;
+  return createComposerAssemblySnapshot({
+    turnId,
+    userMessageId,
+    serviceId: service.serviceId,
+    serviceLabel: service.shortLabel,
+    model: service.model || profile.model,
+    route: policy.route,
+    routeSource: policy.routeSource,
+    targetType: session.targetType,
+    outputMode: session.outputMode,
+    outputLanguage: payload.outputLanguage,
+    productionReviewEnabled: session.productionReviewEnabled,
+    agentInstruction: agentInstructionFor(composerSettings, payload.outputLanguage),
+    taskMethod,
+    userRequest,
+    skills: session.appliedSkills.map((skill, index) => ({
+      skillId: skill.skillId,
+      callName: skill.callName,
+      version: skill.versionId,
+      order: index + 1,
+      instructions: skill.skillMarkdown
+    })),
+    references: session.referenceSnapshots.map((reference) => ({
+      alias: reference.alias,
+      title: reference.title,
+      referenceKind: reference.referenceKind,
+      referenceText: reference.referenceText,
+      sourceLabels: reference.referenceSources.map((source) => source.label),
+      imageCount: reference.imageRefs.length
+    })),
+    retrieval: session.retrievalSnapshot,
+    retrievedSources: session.retrievedSources,
+    media: {
+      imageReferenceMode: session.imageReferenceMode,
+      videoReferenceMode: session.videoReferenceMode,
+      selectedVideoCount,
+      expectedSentVideoCount: session.videoReferenceMode === "text_only" ? 0 : selectedVideoCount,
+      selectedImageCount,
+      expectedSentImageCount,
+      omittedImageCount,
+      omittedReason: omittedImageCount
+        ? session.imageReferenceMode === "text_only"
+          ? "本轮明确选择只发送文字"
+          : "当前创作服务只读取文字"
+        : "",
+      editMode: imageEdit?.mode,
+      baseImageIncluded: Boolean(imageEdit),
+      maskIncluded: imageEdit?.mode === "local"
+    },
+    expectedModelCalls: policy.expectedModelCalls,
+    prerequisiteAnalysisRequests,
+    plannedStages: policy.stages
+  });
+}
+
+function openAssemblyDialog() {
+  if (!composerSession) return;
+  const payload = plannerRequestPayload(composerSession, "", composerSettings);
+  const draftRequest = elements.composerInstruction.value.trim();
+  const snapshot = draftRequest ? null : composerSession.assemblySnapshot;
+  const latestUserRequest = [...composerSession.messages].reverse().find((item) => item.role === "user")?.content || "";
+  const userRequest = draftRequest || snapshot?.userRequest || latestUserRequest;
+  const includeRetrievedSources = !draftRequest;
+  const selectedReferences = snapshot
+    ? snapshot.references.map((item) => `${item.alias} ${item.title}\n${item.referenceText}`)
+    : composerSession.referenceSnapshots.map((item) => `${item.alias} ${item.title}\n${item.referenceText}`);
+  const retrievedReferences = snapshot
+    ? snapshot.retrievedSources.map((item) => `${item.alias} [${item.role}] ${item.title}\n${item.text}`)
+    : includeRetrievedSources
+      ? composerSession.retrievedSources.map((item) => `${item.alias} [${item.role}] ${item.title}\n${item.text}`)
+    : [];
+  const snapshotSkills = snapshot?.skills.map((skill) => `${skill.order}. /${skill.callName} · ${skill.version}\n${skill.instructions}`).join("\n\n");
+  const mediaSummary = snapshot ? [
+    t("手选图片 {selected} 张；预计发送 {sent} 张", { selected: snapshot.media.selectedImageCount, sent: snapshot.media.expectedSentImageCount }),
+    snapshot.media.selectedVideoCount ? t("手选视频 {selected} 个；预计发送 {sent} 个", { selected: snapshot.media.selectedVideoCount, sent: snapshot.media.expectedSentVideoCount }) : "",
+    snapshot.media.baseImageIncluded ? t(snapshot.media.maskIncluded ? "编辑底图已发送；局部遮罩已发送" : "编辑底图已发送") : "",
+    snapshot.media.omittedImageCount ? t("明确未发送 {count} 张：{reason}", { count: snapshot.media.omittedImageCount, reason: translateUiMessage(snapshot.media.omittedReason) }) : ""
+  ].filter(Boolean).join("\n") : "";
+  const layers = composerAssemblyLayers({
+    settings: composerSettings,
+    targetType: snapshot?.targetType || composerSession.targetType,
+    routeMode: snapshot?.route || composerSession.routeMode,
+    outputLanguage: snapshot?.outputLanguage || payload.outputLanguage,
+    productionReviewEnabled: snapshot?.productionReviewEnabled ?? composerSession.productionReviewEnabled,
+    agentInstruction: snapshot?.agentInstruction,
+    taskMethod: snapshot?.taskMethod,
+    userRequest,
+    skills: snapshotSkills || payload.skills.map((skill) => `${skill.order}. /${skill.callName}\n${skill.instructions}`).join("\n\n"),
+    references: [...selectedReferences, ...retrievedReferences].join("\n\n"),
+    retrieval: composerRetrievalSummary(snapshot ?? composerSession),
+    libraryTools: snapshot?.libraryTools ?? composerSession.libraryTools,
+    serviceLabel: snapshot?.serviceLabel,
+    model: snapshot?.model,
+    expectedModelCalls: libraryRetrievalEnabled ? undefined : snapshot?.expectedModelCalls ?? composerTurnPolicyFor(composerSession).expectedModelCalls,
+    prerequisiteAnalysisRequests: snapshot?.prerequisiteAnalysisRequests ?? 0,
+    mediaSummary,
+    actual: snapshot?.actual
+  });
+  elements.composerAssemblyContent.replaceChildren(...layers.map((layer) => {
+    if (["agent", "task"].includes(layer.id)) return assemblyLayer(t(layer.title), layer.content, t("编辑"), async () => {
+      const url = new URL(chrome.runtime.getURL("library.html"));
+      url.searchParams.set("settings", "composer");
+      location.assign(url.href);
+    });
+    if (layer.id === "skills") return assemblyLayer(t(layer.title), layer.content || "本次对话未应用创作 Skill。", t("选择"), async () => {
+      elements.composerAssemblyDialog.close();
+      openSkillWorkspace();
+    });
+    if (layer.id === "references") return assemblyLayer(t(layer.title), layer.content || t("本次对话没有选择参考案例。"), t("编辑"), () => {
+      elements.composerAssemblyDialog.close();
+      openReferenceWorkspace();
+    });
+    if (layer.id === "user") return assemblyLayer(t(layer.title), layer.content || t("等待输入本轮请求"), t("修改"), () => {
+      elements.composerAssemblyDialog.close();
+      if (!elements.composerInstruction.value.trim() && userRequest) elements.composerInstruction.value = userRequest;
+      elements.composerInstruction.focus();
+      renderSendState();
+    });
+    if (layer.id === "retrieval" && draftRequest) return assemblyLayer(t(layer.title), layer.content, t(libraryRetrievalEnabled ? "关闭" : "启用"), () => {
+      elements.composerAssemblyDialog.close();
+      safely(toggleLibraryRetrieval)();
+    });
+    return assemblyLayer(t(layer.title), layer.content);
+  }));
+  elements.composerAssemblyDialog.showModal();
+}
+
+function composerRetrievalSummary(session) {
+  if (!libraryRetrievalEnabled) return "案例库：关闭";
+  return t("案例库：按需 · {candidates} 个候选 · {sources} 条已读来源；仅在你要求查询或参考时调用", { candidates: session?.libraryTools?.candidates.length || 0, sources: session?.retrievedSources?.length || 0 });
+}
+
+function assemblyLayer(title, content, actionLabel, action) {
+  const layer = el("section", "composer-assembly-layer");
+  const body = document.createElement("pre");
+  body.textContent = content;
+  layer.append(rawTextEl("h3", "", title), body);
+  if (actionLabel && action) {
+    const button = textEl("button", "button-secondary", actionLabel);
+    button.addEventListener("click", safely(action));
+    layer.append(button);
+  }
+  return layer;
+}
+
+async function exportComposerDiagnostic() {
+  if (!composerSession) return;
+  if (!await confirmAppAction({ title: t("导出对话诊断？"), description: t("诊断包会包含当前对话、所选参考文字和输出结果，但不会包含 API Key。"), confirmLabel: t("导出") })) return;
+  const diagnostic = buildComposerDiagnostic(composerSession);
+  const blob = new Blob([JSON.stringify(diagnostic, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = diagnosticFilename(composerSession.title);
+    link.click();
+    composerFeedback(t("当前对话诊断包已导出"));
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+}
+
+async function copyPrompt(version, button) {
+  try {
+    await navigator.clipboard.writeText(version.text);
+    const original = button.textContent;
+    button.textContent = t("已复制");
+    setTimeout(() => { button.textContent = original; }, 1200);
+    composerFeedback(t("最终提示词已复制"));
+  } catch (error) {
+    composerFeedback(error.message || t("复制失败，请允许剪贴板权限后重试"), true);
+  }
+}
+
+async function prepareCreativeResult(sessionId, version, button) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "ACTIVATE_CREATIVE_RESULT",
+      sessionId,
+      promptVersionId: version.id
+    });
+    if (!response?.ok) throw new Error(response?.message || t("无法准备结果采集"));
+    const original = button.textContent;
+    button.textContent = t("已准备");
+    setTimeout(() => { button.textContent = original; }, 1200);
+    composerFeedback(response.message);
+  } catch (error) {
+    composerFeedback(error.message || t("无法准备结果采集"), true);
+  }
+}
+
+function createCreativeOutputCards(sessionId, promptVersionId) {
+  return creativeRuns
+    .filter((run) => run.sessionId === sessionId && run.promptVersionId === promptVersionId)
+    .flatMap((run) => run.outputs.map((output) => creativeOutputCard(run, output)));
+}
+
+function creativeOutputCard(run, output) {
+  const card = el("article", "composer-result-card");
+  const videoOutput = output.visual.kind === "video";
+  let mediaView;
+  if (videoOutput) {
+    mediaView = document.createElement("video");
+    mediaView.className = "composer-result-video";
+    mediaView.controls = true;
+    mediaView.playsInline = true;
+    mediaView.preload = "metadata";
+    mediaView.setAttribute("aria-label", t("本次生成视频"));
+    loadCreativeOutputVideo(mediaView, output.visual);
+  } else {
+    mediaView = el("button", "composer-result-image");
+    mediaView.type = "button";
+    mediaView.setAttribute("aria-label", t("全屏查看生成图片"));
+    const image = document.createElement("img");
+    image.alt = t("本次生成结果");
+    loadCreativeOutputImage(image, output.visual.id);
+    mediaView.append(image, rawTextEl("span", "composer-result-expand", t("查看原图")));
+    mediaView.addEventListener("click", () => openCreativeImageWorkspace(run.id, output.visual.id));
+  }
+  const body = el("div", "composer-result-body");
+  const heading = el("div", "composer-result-heading");
+  heading.append(
+    rawTextEl("strong", "", t(videoOutput ? "本次生成视频" : "本次生成结果")),
+    rawTextEl("small", "", relativeTime(output.capturedAt))
+  );
+  body.append(heading);
+  if (!videoOutput && output.evaluation) body.append(creativeEvaluationView(output.evaluation));
+  if (creativeExperimentSettings.enabled) body.append(creativeJudgmentEditor(run, output));
+  const actions = el("div", "composer-result-actions");
+  const primaryActions = el("div", "composer-result-primary-actions");
+  const secondaryActions = el("div", "composer-result-secondary-actions");
+  const saved = entries.some((entry) => entryMediaAssets(entry).some((asset) => asset.id === output.visual.id));
+  const save = textEl("button", saved ? "button-secondary" : "", saved ? "已保存到灵感库" : "保存到灵感库");
+  save.disabled = saved;
+  save.addEventListener("click", () => safely(() => saveCreativeOutput(run.id, output.visual.id, save))());
+  const reroll = textEl("button", "button-secondary", "再生成");
+  reroll.addEventListener("click", () => safely(() => rerollCreativeOutput(run, output))());
+  primaryActions.append(save, reroll);
+  if (!videoOutput) {
+    const reuse = textEl("button", "button-secondary", "作为参考继续");
+    reuse.addEventListener("click", () => safely(() => useCreativeOutputAsReference(run, output))());
+    primaryActions.insertBefore(reuse, reroll);
+    const editCapabilities = composerImageEditCapabilities(composerSession?.generationAiProfile, composerVisionSettings);
+    const edit = textEl("button", "button-secondary", "编辑");
+    edit.disabled = !editCapabilities.whole;
+    edit.title = edit.disabled ? t("请切换到已验证支持图片编辑的 OpenAI 或米醋服务") : "";
+    edit.addEventListener("click", () => openCreativeImageWorkspace(run.id, output.visual.id, true));
+    secondaryActions.append(edit);
+  }
+  if (!videoOutput && creativeExperimentSettings.enabled && !output.evaluation) {
+    const analyze = textEl("button", "button-secondary", "分析对照");
+    analyze.addEventListener("click", () => safely(() => analyzeCreativeOutput(run.id, output.visual.id, analyze))());
+    secondaryActions.append(analyze);
+  }
+  if (!videoOutput && output.evaluation?.primaryDeviation) {
+    const revise = textEl("button", "", "继续优化");
+    revise.addEventListener("click", () => safely(() => continueFromCreativeOutput(run, output))());
+    primaryActions.append(revise);
+  }
+  const remove = textEl("button", "button-danger composer-result-delete", "删除");
+  remove.title = t(videoOutput ? "删除这个生成视频" : "删除这张生成结果");
+  remove.addEventListener("click", () => safely(() => deleteCreativeOutput(run.id, output.visual.id, remove))());
+  secondaryActions.append(remove);
+  actions.append(primaryActions, secondaryActions);
+  body.append(actions);
+  card.append(mediaView, body);
+  return card;
+}
+
+function creativeJudgmentEditor(run, output) {
+  const details = el("details", "composer-result-judgment");
+  const judgmentId = `${run.id}:${output.visual.id}`;
+  details.open = openJudgmentIds.has(judgmentId);
+  details.addEventListener("toggle", () => {
+    details.open ? openJudgmentIds.add(judgmentId) : openJudgmentIds.delete(judgmentId);
+  });
+  const summary = rawTextEl("summary", "", t("记录人工判断"));
+  const form = el("div", "composer-result-judgment-fields");
+  const keep = document.createElement("textarea");
+  keep.rows = 2;
+  keep.placeholder = t("值得保留：哪些选择有效，下一版应保持什么？");
+  keep.setAttribute("aria-label", t("值得保留"));
+  keep.value = output.judgment?.keep ?? "";
+  const improve = document.createElement("textarea");
+  improve.rows = 2;
+  improve.placeholder = t("需要改进：哪一项最影响结果？");
+  improve.setAttribute("aria-label", t("需要改进"));
+  improve.value = output.judgment?.improve ?? "";
+  const feedback = rawTextEl("span", "composer-result-judgment-feedback", judgmentFeedbackById.get(judgmentId) || "");
+  const actions = el("div", "composer-result-judgment-actions");
+  const save = textEl("button", "", output.judgment ? "保存修改" : "保存判断");
+  const clear = textEl("button", "button-secondary", "清空");
+  clear.disabled = !output.judgment;
+  const persist = async (judgment) => {
+    const request = Symbol();
+    judgmentRequestById.set(judgmentId, request);
+    save.disabled = true;
+    clear.disabled = true;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "UPDATE_CREATIVE_JUDGMENT",
+        runId: run.id,
+        visualId: output.visual.id,
+        judgment
+      });
+      // Storage notifications can rebuild this editor before its request returns.
+      // A newer edit in that editor owns both the result and its feedback.
+      if (judgmentRequestById.get(judgmentId) !== request) return;
+      if (!response?.ok) throw new Error(response?.message || t("判断保存失败"));
+      creativeRuns = response.creativeRuns ?? creativeRuns;
+      const feedbackMessage = t(response.message || (response.judgment ? "本次人工判断已保存" : "本次人工判断已清空"));
+      judgmentFeedbackById.set(judgmentId, feedbackMessage);
+      feedback.textContent = feedbackMessage;
+      save.textContent = t(response.judgment ? "保存修改" : "保存判断");
+      clear.disabled = !response.judgment;
+    } finally {
+      if (judgmentRequestById.get(judgmentId) === request) {
+        judgmentRequestById.delete(judgmentId);
+        save.disabled = false;
+      }
+    }
+  };
+  save.addEventListener("click", () => safely(() => persist({ keep: keep.value, improve: improve.value }))());
+  clear.addEventListener("click", () => safely(async () => {
+    keep.value = "";
+    improve.value = "";
+    await persist({ keep: "", improve: "" });
+  })());
+  actions.append(save, clear, feedback);
+  form.append(keep, improve, actions);
+  details.append(summary, form);
+  return details;
+}
+
+function openCreativeImageWorkspace(runId, visualId, startEditing = false) {
+  const items = creativeRuns
+    .filter((run) => run.sessionId === composerSession?.id)
+    .flatMap((run) => run.outputs.filter((output) => output.visual.kind === "image").map((output) => ({
+      run,
+      output,
+      capabilities: composerImageEditCapabilities(composerSession?.generationAiProfile, composerVisionSettings)
+    })))
+    .sort((left, right) => left.output.capturedAt.localeCompare(right.output.capturedAt));
+  const index = items.findIndex((item) => item.run.id === runId && item.output.visual.id === visualId);
+  if (index < 0) return;
+  safely(() => imageWorkspace.open({ items, index, startEditing }))();
+}
+
+async function rerollCreativeOutput(run, output) {
+  if (output.visual.kind === "video") return rerollCreativeVideoOutput(run);
+  const availability = composerImageAvailability(composerSession?.generationAiProfile, composerVisionSettings, {
+    ...composerSession,
+    targetType: "image",
+    referenceSnapshots: restoredReferenceSnapshots(run)
+  });
+  if (!availability.available) throw new Error(availability.message);
+  imageWorkspace.close();
+  return startGeneratedImageTurn({
+    run,
+    displayMessage: "再来一张：沿用这一版提示词和来源快照。",
+    instruction: run.promptText,
+    imageEdit: null
+  });
+}
+
+async function rerollCreativeVideoOutput(run) {
+  const referenceSnapshots = restoredReferenceSnapshots(run);
+  const availability = composerVideoAvailability(composerSession?.generationAiProfile, composerVisionSettings, {
+    ...composerSession,
+    targetType: "video",
+    referenceSnapshots
+  });
+  if (!availability.available) throw new Error(availability.message);
+  if (!composerSession) throw new Error("当前对话已经不存在");
+  if (activeOperation) throw new Error("另一项创作任务正在运行，请先等待或停止");
+  let working = createComposerSession({
+    ...clearComposerFailure(composerSession),
+    targetType: "video",
+    routeMode: "compose",
+    outputMode: "create_video",
+    referenceSnapshots,
+    retrievedSources: restoredRetrievedSources(run),
+    currentInstruction: run.promptText,
+    currentRoute: "compose",
+    currentRouteSource: "manual"
+  });
+  working = appendComposerMessage(working, {
+    role: "user",
+    type: "request",
+    content: "再生成一版：沿用这一版提示词和来源快照。",
+    route: "compose",
+    routeSource: "manual"
+  });
+  const userMessageId = working.messages.at(-1).id;
+  working = createComposerSession({
+    ...working,
+    assemblySnapshot: freezeComposerAssemblySnapshot(working, {
+      turnId: crypto.randomUUID(),
+      userMessageId,
+      userRequest: working.messages.at(-1).content,
+      policy: composerTurnPolicyFor(working)
+    })
+  });
+  composerSession = working;
+  renderComposer();
+  return startPersistentCreativeJob({ session: working, userMessageId, startPhase: "generation", imageEdit: null });
+}
+
+async function editCreativeOutput(run, output, request) {
+  const capabilities = composerImageEditCapabilities(composerSession?.generationAiProfile, composerVisionSettings);
+  if (!capabilities.whole || (request.mode === "local" && !capabilities.local)) {
+    throw new Error("当前创作服务没有经过验证的图片编辑协议");
+  }
+  const baseBlob = await getScreenshotBlob(output.visual.id);
+  if (!(baseBlob instanceof Blob)) throw new Error("当前结果底图已经不存在");
+  const jobId = `creative:${crypto.randomUUID()}`;
+  const maskAssetId = request.mode === "local" ? `creative-job-mask:${jobId}` : "";
+  if (maskAssetId) {
+    if (!(request.maskBlob instanceof Blob)) throw new Error("局部修改缺少有效遮罩");
+    await saveScreenshotBlob(maskAssetId, request.maskBlob);
+  }
+  const imageEdit = {
+    mode: request.mode,
+    parentVisualId: output.visual.id,
+    originalPrompt: run.promptText,
+    modification: request.instruction,
+    maskAssetId
+  };
+  try {
+    return await startGeneratedImageTurn({
+      run,
+      displayMessage: request.instruction,
+      instruction: request.instruction,
+      imageEdit,
+      jobId
+    });
+  } catch (error) {
+    if (maskAssetId) await deleteScreenshotBlob(maskAssetId).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function startGeneratedImageTurn({ run, displayMessage, instruction, imageEdit, jobId = "" }) {
+  if (!composerSession) throw new Error("当前对话已经不存在");
+  if (activeOperation) throw new Error("另一项创作任务正在运行，请先等待或停止");
+  let working = createComposerSession({
+    ...clearComposerFailure(composerSession),
+    targetType: "image",
+    routeMode: "compose",
+    outputMode: "create_image",
+    referenceSnapshots: restoredReferenceSnapshots(run),
+    retrievedSources: restoredRetrievedSources(run),
+    currentInstruction: instruction,
+    currentRoute: "compose",
+    currentRouteSource: "manual"
+  });
+  working = appendComposerMessage(working, {
+    role: "user",
+    type: "request",
+    content: displayMessage,
+    route: "compose",
+    routeSource: "manual"
+  });
+  const userMessageId = working.messages.at(-1).id;
+  working = createComposerSession({
+    ...working,
+    assemblySnapshot: freezeComposerAssemblySnapshot(working, {
+      turnId: crypto.randomUUID(),
+      userMessageId,
+      userRequest: displayMessage,
+      policy: composerTurnPolicyFor(working),
+      imageEdit
+    })
+  });
+  composerSession = working;
+  renderComposer();
+  return startPersistentCreativeJob({
+    session: working,
+    userMessageId,
+    startPhase: "generation",
+    imageEdit,
+    jobId
+  });
+}
+
+function restoredReferenceSnapshots(run) {
+  return (run.referenceSnapshots ?? []).map((reference, index) => ({
+    ...reference,
+    entryId: `creative-run:${run.id}:reference:${index + 1}`
+  }));
+}
+
+function restoredRetrievedSources(run) {
+  return (run.retrievedSources ?? []).map((source, index) => ({
+    ...source,
+    entryId: `creative-run:${run.id}:retrieved:${index + 1}`
+  }));
+}
+
+async function useCreativeOutputAsReference(run, output) {
+  if (!composerSession) return;
+  if (activeOperation) throw new Error("生成期间不能修改当前参考");
+  const entryId = `creative-output:${output.visual.id}`;
+  if (composerSession.referenceSnapshots.some((item) => item.entryId === entryId)) {
+    imageWorkspace.close();
+    return composerFeedback("这张结果已经在本次参考中");
+  }
+  const alias = currentLocale() === "en"
+    ? `@Reference${composerSession.referenceSnapshots.length + 1}`
+    : `@参考${composerSession.referenceSnapshots.length + 1}`;
+  composerSession = createComposerSession({
+    ...composerSession,
+    referenceSnapshots: [...composerSession.referenceSnapshots, {
+      entryId,
+      alias,
+      title: run.title || "生成结果",
+      referenceKind: "prompt",
+      referenceText: run.promptText,
+      originalText: run.promptText,
+      imageRefs: [{ visualId: output.visual.id, mimeType: output.visual.mimeType }]
+    }],
+    currentInstruction: "",
+    retrievedSources: [],
+    currentRoute: "",
+    currentRouteSource: ""
+  });
+  composerSession = await saveSession(composerSession);
+  const response = await chrome.runtime.sendMessage({
+    type: "RECORD_CREATIVE_SIGNAL",
+    runId: run.id,
+    visualId: output.visual.id,
+    signalType: "reused_as_reference"
+  });
+  if (response?.ok) creativeRuns = response.creativeRuns ?? creativeRuns;
+  imageWorkspace.close();
+  renderComposer();
+  composerFeedback(t("已作为 {alias} 加入本次参考", { alias }));
+}
+
+function normalizeEntryVisualIds(entry) {
+  return Array.isArray(entry?.mediaAssets)
+    ? entryMediaAssets(entry).filter((asset) => asset.kind === "image" && asset.usage !== "poster")
+      .map((visual) => String(visual?.id ?? "")).filter(Boolean)
+    : Array.isArray(entry?.visuals)
+      ? entry.visuals.map((visual) => String(visual?.id ?? "")).filter(Boolean)
+    : entry?.hasScreenshot ? [String(entry.id ?? "")] : [];
+}
+
+function creativeEvaluationView(evaluation) {
+  const wrap = el("div", "composer-result-evaluation");
+  wrap.append(rawTextEl("p", "", evaluation.summary));
+  const details = document.createElement("details");
+  details.append(rawTextEl("summary", "", t("查看对照")));
+  const list = el("ul", "");
+  for (const check of evaluation.checks ?? []) {
+    list.append(rawTextEl("li", `status-${check.status}`, `${creativeCheckLabel(check.status)} · ${check.criterion}：${check.evidence}`));
+  }
+  if (evaluation.primaryDeviation) {
+    list.append(rawTextEl("li", "primary-deviation", t("主要偏差：{finding}", { finding: evaluation.primaryDeviation.finding })));
+  }
+  details.append(list);
+  wrap.append(details);
+  return wrap;
+}
+
+async function saveCreativeOutput(runId, visualId, button = null) {
+  if (button) button.disabled = true;
+  try {
+    const response = await sendWithGenerationPromptConfirmation({ type: "SAVE_CREATIVE_OUTPUT_TO_LIBRARY", runId, visualId });
+    if (!response?.ok) throw new Error(response?.message || t("保存失败"));
+    creativeRuns = response.creativeRuns ?? creativeRuns;
+    if (response.entry) {
+      physicalEntries = [...physicalEntries.filter((item) => item.id !== response.entry.id), response.entry];
+      entries = materializeLogicalCases(physicalEntries, compoundCases);
+    }
+    composerFeedback(response.message);
+    renderTimeline();
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function analyzeCreativeOutput(runId, visualId, button) {
+  button.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "ANALYZE_CREATIVE_OUTPUT", runId, visualId });
+    if (!response?.ok) throw new Error(response?.message || t("视觉对照失败"));
+    creativeRuns = response.creativeRuns ?? creativeRuns;
+    composerFeedback(response.message);
+    renderTimeline();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function continueFromCreativeOutput(run, output) {
+  const deviation = output.evaluation?.primaryDeviation;
+  if (!deviation || activeOperation) return;
+  await chrome.runtime.sendMessage({
+    type: "RECORD_CREATIVE_SIGNAL",
+    runId: run.id,
+    visualId: output.visual.id,
+    signalType: "continued_revision"
+  });
+  elements.composerInstruction.value = currentLocale() === "en"
+    ? `Revise the current prompt using this real-result comparison. Change only this one causal issue and keep every other confirmed part stable:\n${deviation.criterion}: ${deviation.finding}\nSuggested change: ${deviation.suggestedChange}`
+    : `根据这次真实生成结果，只修改这一项最可能的原因，其余已确认内容保持不变：\n${deviation.criterion}：${deviation.finding}\n建议修改：${deviation.suggestedChange}`;
+  resizeComposerInput();
+  await handleComposerAction();
+}
+
+async function deleteCreativeOutput(runId, visualId, button = null) {
+  const output = creativeRuns.flatMap((run) => run.outputs).find((item) => item.visual.id === visualId);
+  const confirmation = output?.visual.kind === "video"
+    ? t("删除这个生成视频？如果已保存到灵感库，灵感库中的案例不会删除。")
+    : t("删除这张生成结果？如果已保存到灵感库，灵感库中的案例不会删除。");
+  if (!await confirmAppAction({ title: t("删除生成结果？"), description: confirmation, confirmLabel: t("删除"), danger: true })) return false;
+  if (button) button.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "DELETE_CREATIVE_OUTPUT", runId, visualId });
+    if (!response?.ok) throw new Error(response?.message || t("移除失败"));
+    creativeRuns = response.creativeRuns ?? creativeRuns;
+    composerFeedback(response.message);
+    renderTimeline();
+    return true;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function loadCreativeOutputImage(image, visualId) {
+  try {
+    let url = thumbnailUrls.get(`creative:${visualId}`);
+    if (!url) {
+      const blob = await getScreenshotBlob(visualId);
+      if (!blob) return;
+      url = URL.createObjectURL(blob);
+      thumbnailUrls.set(`creative:${visualId}`, url);
+    }
+    image.src = url;
+  } catch {}
+}
+
+async function loadCreativeOutputVideo(video, visual) {
+  try {
+    const key = `creative:${visual.id}`;
+    let url = thumbnailUrls.get(key);
+    if (!url) {
+      const blob = await getMediaBlob(visual.id);
+      if (!(blob instanceof Blob)) return;
+      url = URL.createObjectURL(blob);
+      thumbnailUrls.set(key, url);
+    }
+    video.src = url;
+    const posterBlob = (visual.posterAssetId ? await getMediaBlob(visual.posterAssetId) : null)
+      ?? (await getDerivedMedia(visual.id).catch(() => null))?.thumbnail;
+    if (posterBlob instanceof Blob) {
+      const posterKey = `creative-poster:${visual.id}`;
+      let posterUrl = thumbnailUrls.get(posterKey);
+      if (!posterUrl) {
+        posterUrl = URL.createObjectURL(posterBlob);
+        thumbnailUrls.set(posterKey, posterUrl);
+      }
+      video.poster = posterUrl;
+    }
+  } catch {}
+}
+
+function creativeCheckLabel(status) {
+  return t({
+    met: "符合",
+    partial: "部分符合",
+    missed: "未实现",
+    conflict: "存在冲突",
+    unknown: "无法判断"
+  }[status] || "无法判断");
+}
+
+async function savePromptVersion(sessionId, version, button) {
+  button.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "SAVE_COMPOSER_RESULT",
+      sessionId,
+      promptVersionId: version.id,
+      title: version.title || composerSession.title
+    });
+    if (!response?.ok) throw new Error(response?.message || t("保存失败"));
+    composerFeedback(response.message || t("已保存为新案例"));
+  } catch (error) {
+    composerFeedback(error.message || t("保存失败"), true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderSendState() {
+  for (const element of composerFeedbackElements()) {
+    setTaskFeedbackState(element, { pending: Boolean(element.textContent) && Boolean(activeOperation), error: element.classList.contains("error") });
+  }
+  const ready = composerInitializationComplete && Boolean(composerSession);
+  elements.composerInstruction.disabled = !ready;
+  elements.composerAction.disabled = !ready;
+  if (!ready) return;
+  renderComposerAiProfile();
+  const prompts = composerSession.referenceSnapshots.filter((item) => item.referenceKind === "prompt").length;
+  const descriptions = composerSession.referenceSnapshots.filter((item) => item.referenceKind === "vision").length;
+  const images = composerSession.referenceSnapshots.reduce((sum, item) => sum + item.imageRefs.length, 0);
+  const usage = composerInputUsage(composerSession, elements.composerInstruction.value, composerSettings);
+  renderReferenceInputs();
+  const toolState = composerSession.libraryTools;
+  const requestUsage = toolState.usage && toolState.usageRequestCount === toolState.requestCount
+    ? t("输入 {input} / 输出 {output} tokens", { input: toolState.usage.promptTokens, output: toolState.usage.completionTokens }) : t("用量未知");
+  const requestLabel = toolState.requestCount ? t("本轮已请求 {count} 次 · {usage}", { count: toolState.requestCount, usage: requestUsage }) : t("按任务执行");
+  const retrievalLabel = t(!libraryRetrievalEnabled ? "案例库：关闭" : composerLibraryToolService(composerSession, composerAiSettings, composerVisionSettings).nativeTools ? "案例库：按需" : "案例库：手动选择");
+  elements.composerSendNote.textContent = t("{prompts} 条提示词原文 · {images} 张手选原图 · {descriptions} 条画面描述 · {characters} 字符 · {retrieval} · {request} · 本轮已附 {attached} 张图片", {
+    prompts, images, descriptions, characters: usage.characters.toLocaleString("en-US"), retrieval: retrievalLabel, request: requestLabel, attached: toolState.imageIds.length
+  });
+  const currentRun = activeOperation?.kind === "compose" && activeOperation.sessionId === composerSession.id;
+  if (currentRun) {
+    elements.composerAction.dataset.state = activeOperation.phase === "stopping" ? "stopping" : "stop";
+    elements.composerAction.disabled = false;
+    elements.composerAction.setAttribute("aria-label", t(activeOperation.phase === "stopping" ? "正在停止" : "停止"));
+    setUiIcon(elements.composerAction, activeOperation.phase === "stopping" ? "ellipsis" : "square");
+  } else {
+    elements.composerAction.dataset.state = "send";
+    elements.composerAction.disabled = Boolean(activeOperation);
+    elements.composerAction.setAttribute("aria-label", t("发送"));
+    setUiIcon(elements.composerAction, "send");
+  }
+}
+
+function composerTurnPolicyFor(session) {
+  if (!session || !["create_image", "create_video"].includes(session.outputMode)) {
+    return resolveComposerTurnPolicy({ routeMode: session?.routeMode, outputMode: session?.outputMode });
+  }
+  const profile = normalizeComposerAiProfile(session.generationAiProfile);
+  const videoTask = session.outputMode === "create_video";
+  const availability = videoTask
+    ? composerVideoAvailability(profile, composerVisionSettings, { ...session, aiProfile: profile })
+    : composerImageAvailability(profile, composerVisionSettings, { ...session, aiProfile: profile });
+  return resolveComposerTurnPolicy({
+    routeMode: session.routeMode,
+    outputMode: session.outputMode,
+    generationCapability: {
+      available: availability.available,
+      issue: availability.available ? "" : availability.message,
+      requiresPromptAssembly: composerGenerationRequiresPromptAssembly(profile, composerVisionSettings, session)
+    }
+  });
+}
+
+function operationLabel(phase) {
+  const session = activeOperation?.session;
+  const generationPhase = ["streaming", "stopping"].includes(phase) && ["create_image", "create_video"].includes(session?.outputMode);
+  const profile = generationPhase ? session?.generationAiProfile : session?.aiProfile;
+  const service = selectedComposerService(profile, composerAiSettings, composerVisionSettings).shortLabel;
+  return ({
+    planning: t("{service} 正在规划", { service }),
+    streaming: routeOperationLabel(activeOperation?.executionRoute || activeOperation?.session?.currentRoute),
+    stopping: t("正在停止 {service}", { service })
+  })[phase] || t("{service} 正在处理", { service });
+}
+
+function routeOperationLabel(route) {
+  const session = activeOperation?.session;
+  const profile = ["create_image", "create_video"].includes(session?.outputMode)
+    ? session?.generationAiProfile
+    : session?.aiProfile;
+  const service = selectedComposerService(profile, composerAiSettings, composerVisionSettings).shortLabel;
+  if (route === "analyze_materials") return t("{service} 正在分析资料", { service });
+  if (route === "chat") return t("{service} 正在回答", { service });
+  if (activeOperation?.session?.outputMode === "create_video") return t("{service} 正在创建视频", { service });
+  return activeOperation?.session?.outputMode === "create_image"
+    ? t("{service} 正在创建图片", { service })
+    : t("{service} 正在生成", { service });
+}
+
+function referenceAliasButton(reference) {
+  const card = el("article", "button-secondary composer-input-reference-card");
+  const button = el("button", "composer-input-reference-main");
+  button.type = "button";
+  const entry = entries.find((item) => item.id === reference.entryId);
+  const mediaEntry = entry ? normalizeEntryMedia(entry) : null;
+  const mainMedia = mediaEntry ? primaryMediaAsset(mediaEntry) : null;
+  const referenceMedia = mediaEntry?.mediaAssets?.find((asset) => asset.id === reference.assetId)
+    ?? mediaEntry?.mediaAssets?.find((asset) => reference.imageRefs?.some((imageRef) => imageRef.visualId === asset.id))
+    ?? mainMedia;
+  const displayAsset = referenceMedia?.kind === "video"
+    ? posterAssetForVideo(mediaEntry, referenceMedia)
+    : referenceMedia?.kind === "image" ? referenceMedia : entry ? primaryVisual(entry) : null;
+  const visual = el("span", "composer-input-reference-visual");
+  if (displayAsset) {
+    const image = document.createElement("img");
+    image.alt = "";
+    image.dataset.visualId = displayAsset.id;
+    const cached = thumbnailUrls.get(displayAsset.id);
+    if (cached) image.src = cached;
+    else imageObserver.observe(image);
+    visual.append(image);
+  } else visual.append(rawTextEl("span", "", referenceTypeLabel(reference, referenceMedia)));
+  const copy = el("span", "composer-input-reference-copy");
+  copy.append(rawTextEl("small", "", reference.alias), rawTextEl("strong", "", reference.title || t("未命名案例")));
+  button.append(visual, copy);
+  button.title = `${reference.alias} · ${reference.title || t("未命名案例")}`;
+  button.addEventListener("click", () => insertComposerAlias(reference.alias));
+  const remove = el("button", "icon-button composer-input-reference-remove");
+  remove.type = "button";
+  remove.title = t("取消参考");
+  remove.setAttribute("aria-label", t("取消参考：{title}", { title: reference.title || reference.alias }));
+  remove.disabled = Boolean(activeOperation);
+  remove.append(createUiIcon("x"));
+  remove.addEventListener("click", () => safely(async () => {
+    if (!composerSession || activeOperation) return;
+    composerSession = await saveSession(createComposerSession({
+      ...composerSession,
+      referenceSnapshots: composerSession.referenceSnapshots.filter(item => item.referenceId !== reference.referenceId),
+      retrievedSources: composerSession.retrievedSources.filter(item => item.entryId !== reference.entryId),
+      currentInstruction: "", currentRoute: "", currentRouteSource: ""
+    }));
+    renderComposer();
+  })());
+  card.append(button, remove);
+  return card;
+}
+
+function createLibraryCandidate(candidate, index) {
+  const item = el("article", "composer-library-candidate");
+  item.dataset.entryId = candidate.caseId;
+  const open = el("a", "composer-library-candidate-open");
+  open.href = `library.html?case=${encodeURIComponent(candidate.caseId)}`;
+  open.target = "_blank";
+  open.title = [candidate.title, candidate.excerpt].filter(Boolean).join("\n");
+  open.setAttribute("aria-label", t("查看案例：{title}", { title: candidate.title }));
+  const entry = entries.find((entry) => entry.id === candidate.caseId);
+  const media = entry ? primaryMediaAsset(entry) : null;
+  const visualAsset = media?.kind === "video" ? posterAssetForVideo(entry, media) : entry ? primaryVisual(entry) : null;
+  const visual = el("span", "composer-library-candidate-visual");
+  visual.setAttribute("aria-hidden", "true");
+  visual.append(createUiIcon(visualAsset ? "image" : media?.kind === "video" ? "video" : "file-text"),
+    rawTextEl("span", "", t(visualAsset ? "图片" : media?.kind === "video" ? "视频" : "文字资料")));
+  if (visualAsset) {
+    const image = document.createElement("img");
+    image.alt = "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.dataset.visualId = visualAsset.id;
+    image.dataset.thumbnailKey = `preview:${visualAsset.id}`;
+    image.addEventListener("error", () => image.remove(), { once: true });
+    const cached = thumbnailUrls.get(image.dataset.thumbnailKey);
+    if (cached) image.src = cached;
+    else imageObserver.observe(image);
+    visual.append(image);
+  }
+  open.append(visual, rawTextEl("span", "composer-library-candidate-title", `${index + 1}. ${candidate.title || t("未命名案例")}`));
+  const selected = composerSession.referenceSnapshots.some(reference => reference.entryId === candidate.caseId);
+  const select = textEl("button", "button-secondary composer-library-candidate-select", selected ? "调整参考" : "选作参考");
+  select.type = "button";
+  select.disabled = !entry || Boolean(activeOperation) || !isComposerEligibleEntry(entry, composerSession.targetType, { documentTextByEntryId: composerDocumentTextByEntryId });
+  select.addEventListener("click", () => openReferenceWorkspace({ entryId: candidate.caseId }));
+  item.append(open, select);
+  return item;
+}
+
+function createRetrievedSourceSnapshot(sourcesValue) {
+  const sources = Array.isArray(sourcesValue) ? sourcesValue : [];
+  if (!sources.length) return null;
+  const snapshot = el("section", "composer-version-sources");
+  snapshot.append(rawTextEl("small", "composer-version-sources-label", t("本轮采用的本地来源")));
+  const list = el("div", "composer-version-source-list");
+  list.append(...sources.map((source) => {
+    const item = el("span", "composer-version-source");
+    item.append(rawTextEl("small", "", retrievedSourceRole(source.role)), rawTextEl("strong", "", source.title || source.alias));
+    return item;
+  }));
+  snapshot.append(list);
+  return snapshot;
+}
+
+function retrievedSourceRole(role) {
+  return ({ case: t("案例"), guide: t("攻略教程") })[role] || t("资料");
+}
+
+function referenceTypeLabel(reference, media) {
+  if (media?.kind === "video") return "VIDEO";
+  if (media?.kind === "document") return media.mimeType === "application/pdf" ? "PDF" : "DOC";
+  return reference.referenceKind === "vision" ? "IMAGE" : "TEXT";
+}
+
+function insertComposerAlias(alias) {
+  const input = elements.composerInstruction;
+  const before = input.value.slice(0, input.selectionStart);
+  const after = input.value.slice(input.selectionEnd);
+  const separator = before && !/\s$/.test(before) ? " " : "";
+  input.value = `${before}${separator}${alias} ${after}`;
+  const cursor = before.length + separator.length + alias.length + 1;
+  input.setSelectionRange(cursor, cursor);
+  resizeComposerInput();
+  input.focus();
+}
+
+function composerFeedback(message, error = false) {
+  clearTimeout(feedbackTimer);
+  const target = activeComposerFeedbackElement();
+  for (const element of composerFeedbackElements()) {
+    if (element !== target) {
+      element.textContent = "";
+      setTaskFeedbackState(element);
+    }
+  }
+  target.textContent = translateUiMessage(String(message ?? ""));
+  setTaskFeedbackState(target, { error, pending: Boolean(message) && Boolean(activeOperation) });
+  if (message && !error && !activeOperation) feedbackTimer = setTimeout(() => {
+    target.textContent = "";
+    setTaskFeedbackState(target);
+  }, 5000);
+}
+
+function activeComposerFeedbackElement() {
+  if (!elements.composerReferenceWorkspace.hidden) return elements.composerReferenceFeedback;
+  return elements.composerFeedback;
+}
+
+function composerFeedbackElements() {
+  return [elements.composerFeedback, elements.composerReferenceFeedback];
+}
+
+function clearComposerFeedback() {
+  clearTimeout(feedbackTimer);
+  feedbackTimer = 0;
+  for (const element of composerFeedbackElements()) {
+    element.textContent = "";
+    setTaskFeedbackState(element);
+  }
+}
+
+function safely(action) {
+  return (...args) => {
+    Promise.resolve(action(...args)).catch((error) => composerFeedback(error.message || t("操作失败"), true));
+  };
+}
+
+function resizeComposerInput() {
+  const input = elements.composerInstruction;
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 220)}px`;
+}
+
+function selectedTargetType() {
+  return document.querySelector('input[name="composer-type"]:checked')?.value === "video" ? "video" : "image";
+}
+
+function sessionSummaryFromCurrent() {
+  if (!composerSession || !isMeaningfulComposerSession(composerSession)) return null;
+  return {
+    id: composerSession.id,
+    title: composerSession.title,
+    targetType: composerSession.targetType,
+    updatedAt: composerSession.updatedAt,
+    referenceCount: composerSession.referenceSnapshots.length,
+    hasPrompt: composerSession.promptVersions.length > 0
+  };
+}
+
+function conversationTitle(instruction) {
+  const firstLine = String(instruction ?? "").split(/\r?\n/, 1)[0];
+  return excerpt(firstLine, COMPOSER_TITLE_MAX_CHARACTERS) || (composerSession?.targetType === "video" ? t("未命名视频提示词") : t("未命名图片提示词"));
+}
+
+function uniqueIds(values) {
+  return [...new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean))];
+}
+
+function excerpt(value, length) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length > length ? `${text.slice(0, length).trim()}…` : text;
+}
+
+function relativeTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString(currentLocale() === "en" ? "en" : "zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+async function prepareSelectedReferenceImages(session) {
+  const temporaryAssetIds = new Set((session?.referenceSnapshots ?? [])
+    .filter((reference) => reference.sourceType === TEMP_REFERENCE_SOURCE_TYPES.temporary)
+    .flatMap((reference) => reference.assetRefs ?? [])
+    .filter((asset) => asset.kind === "image")
+    .map((asset) => asset.assetId));
+  const refs = [...new Map((session?.referenceSnapshots ?? [])
+    .flatMap((reference) => reference.imageRefs ?? [])
+    .map((item) => [item.visualId, item])).values()];
+  return Promise.all(refs.map(async (imageRef) => {
+    const blob = temporaryAssetIds.has(imageRef.visualId)
+      ? await getMediaBlob(imageRef.visualId)
+      : await getScreenshotBlob(imageRef.visualId);
+    if (!blob) throw new ComposerServiceError("有一张手选内容图已不存在，本次没有发送不完整参考", 422, { retryable: true });
+    const derived = temporaryAssetIds.has(imageRef.visualId) && blob.type === "image/gif"
+      ? await getDerivedMedia(imageRef.visualId)
+      : null;
+    const preparedBlob = derived?.thumbnail instanceof Blob ? derived.thumbnail : blob;
+    return {
+      visualId: imageRef.visualId,
+      mimeType: preparedBlob.type,
+      dataUrl: await blobToDataUrl(preparedBlob)
+    };
+  }));
+}
+
+async function persistGeneratedImages(session, promptVersionId, imageResults, generation = {}) {
+  if (!promptVersionId) throw new Error("生成图片缺少对应的提示词版本");
+  const savedIds = [];
+  try {
+    const visuals = [];
+    for (const item of Array.isArray(imageResults) ? imageResults : []) {
+      const blob = item?.blob;
+      if (!(blob instanceof Blob) || !blob.type.startsWith("image/") || !blob.size) throw new Error("生图服务没有返回有效图片");
+      const { width, height } = await readImageDimensions(blob);
+      assertImageDimensions(width, height);
+      const id = crypto.randomUUID();
+      await saveScreenshotBlob(id, blob);
+      savedIds.push(id);
+      visuals.push({
+        id,
+        kind: "image",
+        usage: "content",
+        storageMode: "managed",
+        mimeType: blob.type,
+        width,
+        height,
+        byteSize: blob.size,
+        capturedAt: new Date().toISOString(),
+        reviewStatus: "unverified"
+      });
+    }
+    if (!visuals.length) throw new Error("生图服务没有返回图片");
+    const response = await chrome.runtime.sendMessage({
+      type: "REGISTER_GENERATED_OUTPUTS",
+      sessionId: session.id,
+      promptVersionId,
+      visuals,
+      generation
+    });
+    if (!response?.ok) throw new Error(response?.message || "生成结果登记失败");
+    return response.creativeRuns ?? creativeRuns;
+  } catch (error) {
+    await Promise.allSettled(savedIds.map((id) => deleteScreenshotBlob(id)));
+    throw error;
+  }
+}
+
+async function privateComposerServiceSettings() {
+  const response = await chrome.runtime.sendMessage({ type: "GET_COMPOSER_AI_RUNTIME" });
+  if (!response?.ok) throw new Error(response?.message || "无法读取创作服务配置");
+  composerAiRuntimeProtocolVersion = Number(response.aiRuntimeProtocolVersion) || null;
+  composerAiTaskAssignments = response.aiTaskAssignments ?? {};
+  return {
+    ai: normalizeAiSettings(response.aiSettings),
+    vision: {
+      ...normalizeVisionSettings(response.visionSettings),
+      xai: response.visionSettings?.xai,
+      providerProfiles: response.visionSettings?.providerProfiles
+    }
+  };
+}
+
+async function refreshComposerServiceSettings() {
+  ({ ai: composerAiSettings, vision: composerVisionSettings } = await privateComposerServiceSettings());
+  if (composerSession) renderComposer();
+}
+
+function camel(value) {
+  return value.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+}
+
+function el(tag, className = "") {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  return node;
+}
+
+function rawTextEl(tag, className, text) {
+  const node = el(tag, className);
+  node.textContent = String(text ?? "");
+  return node;
+}
+
+function textEl(tag, className, text) {
+  return rawTextEl(tag, className, t(text));
+}
+
+async function readWorkspaceLibraryState() {
+  const reader = createLibraryViewReader({
+    storage: getLibraryStorage(),
+    prepare: ({ summaryOnly, creativeSummary } = {}) => chrome.runtime.sendMessage({ type: 'PREPARE_LIBRARY_VIEW_STATE', summaryOnly, creativeSummary }),
+    uiLanguage: chrome.i18n.getUILanguage(),
+    includeCreativeState: true
+  });
+  return reader();
+}

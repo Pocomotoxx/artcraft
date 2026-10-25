@@ -1,0 +1,649 @@
+import { analysisTaxonomyPayload, validateAnalysisTagResponse } from "./tag-taxonomy.js";
+import { createVisualModelResponseSchema } from "./visual-result-schema.js";
+
+export const VISUAL_ANALYSIS_VERSION = 2;
+export const VISUAL_SET_SUMMARY_VERSION = 1;
+export const VISUAL_MODEL_PROTOCOL_VERSION = "reconstruction-tags-v1";
+export const VISUAL_ANALYSIS_DIMENSIONS = Object.freeze([
+  "subject",
+  "scene",
+  "action",
+  "style",
+  "camera",
+  "light",
+  "mood",
+  "sound",
+  "output",
+  "workflow"
+]);
+
+const MEASUREMENT_SOURCES = Object.freeze(["measured", "estimated", "not_observable"]);
+const ORIENTATIONS = Object.freeze(["landscape", "portrait", "square"]);
+const DEPTH_LAYERS = Object.freeze(["foreground", "midground", "background", "overlay"]);
+const OCR_LEGIBILITY = Object.freeze(["exact", "partial", "unreadable"]);
+const ROOT_FIELDS = new Set([
+  "description", "canvas", "elements", "dimensions", "ocr", "reconstructionPrompt",
+  "limitations", "completeness", "tags"
+]);
+const ROOT_FIELDS_BY_CASE = new Map([...ROOT_FIELDS].map((field) => [field.toLocaleLowerCase("en-US"), field]));
+const ROOT_FIELD_ALIASES = new Map([...ROOT_FIELDS].flatMap((field) => [
+  [field.toLocaleLowerCase("en-US"), field],
+  [field.replace(/[A-Z]/g, (character) => `_${character.toLocaleLowerCase("en-US")}`), field]
+]));
+
+const BBOX_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: ["x", "y", "width", "height", "source"],
+  properties: {
+    x: { type: "number", minimum: 0, maximum: 1000 },
+    y: { type: "number", minimum: 0, maximum: 1000 },
+    width: { type: "number", minimum: 0, maximum: 1000 },
+    height: { type: "number", minimum: 0, maximum: 1000 },
+    source: { type: "string", enum: MEASUREMENT_SOURCES }
+  }
+});
+
+export const VISUAL_ANALYSIS_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: [...ROOT_FIELDS],
+  properties: {
+    description: { type: "string", minLength: 1 },
+    canvas: {
+      type: "object",
+      additionalProperties: false,
+      required: ["width", "height", "aspectRatio", "orientation", "dominantColors"],
+      properties: {
+        width: { type: "integer", minimum: 1 },
+        height: { type: "integer", minimum: 1 },
+        aspectRatio: { type: "string", minLength: 1 },
+        orientation: { type: "string", enum: ORIENTATIONS },
+        dominantColors: {
+          type: "array",
+          maxItems: 12,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["hex", "coveragePercent", "source"],
+            properties: {
+              hex: { type: "string", pattern: "^#[0-9A-Fa-f]{6}$" },
+              coveragePercent: { type: "number", minimum: 0, maximum: 100 },
+              source: { type: "string", enum: MEASUREMENT_SOURCES }
+            }
+          }
+        }
+      }
+    },
+    elements: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "id", "label", "category", "bbox", "coveragePercent", "depthLayer",
+          "occludes", "occludedBy", "relationships", "visualAttributes"
+        ],
+        properties: {
+          id: { type: "string", minLength: 1 },
+          label: { type: "string", minLength: 1 },
+          category: { type: "string", minLength: 1 },
+          bbox: BBOX_SCHEMA,
+          coveragePercent: { type: "number", minimum: 0, maximum: 100 },
+          depthLayer: { type: "string", enum: DEPTH_LAYERS },
+          occludes: { type: "array", items: { type: "string" } },
+          occludedBy: { type: "array", items: { type: "string" } },
+          relationships: { type: "array", items: { type: "string" } },
+          visualAttributes: { type: "array", items: { type: "string" } }
+        }
+      }
+    },
+    dimensions: {
+      type: "array",
+      minItems: VISUAL_ANALYSIS_DIMENSIONS.length,
+      maxItems: VISUAL_ANALYSIS_DIMENSIONS.length,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "applicable", "facts", "measurements"],
+        properties: {
+          id: { type: "string", enum: VISUAL_ANALYSIS_DIMENSIONS },
+          applicable: { type: "boolean" },
+          facts: { type: "array", items: { type: "string" } },
+          measurements: { type: "array", items: { type: "string" } }
+        }
+      }
+    },
+    ocr: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["text", "legibility", "bbox", "typography"],
+        properties: {
+          text: { type: "string" },
+          legibility: { type: "string", enum: OCR_LEGIBILITY },
+          bbox: BBOX_SCHEMA,
+          typography: { type: "array", items: { type: "string" } }
+        }
+      }
+    },
+    reconstructionPrompt: { type: "string", minLength: 1 },
+    limitations: { type: "array", items: { type: "string" } },
+    completeness: {
+      type: "object",
+      additionalProperties: false,
+      required: ["checkedRegions", "omittedVisibleElements"],
+      properties: {
+        checkedRegions: { type: "array", minItems: 1, items: { type: "string" } },
+        omittedVisibleElements: { type: "array", items: { type: "string" } }
+      }
+    },
+    tags: {
+      type: "array",
+      maxItems: 6,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["g", "t"],
+        properties: {
+          g: { type: "string" },
+          t: { type: ["string", "null"] }
+        }
+      }
+    }
+  }
+});
+
+const MODEL_BOX_SCHEMA = Object.freeze({
+  type: "array",
+  minItems: 4,
+  maxItems: 4,
+  items: { type: "integer", minimum: 0, maximum: 1000 }
+});
+
+export const VISUAL_MODEL_RESPONSE_SCHEMA = Object.freeze(createVisualModelResponseSchema());
+
+export function visualModelResponseSchema(catalog) {
+  const schema = createVisualModelResponseSchema();
+  schema.properties.tags.items.properties.g.enum = fixedTagGroupIds(catalog);
+  return schema;
+}
+
+export function compileVisualAnalysisInstruction({ catalog, customInstruction = "", locale = "zh-CN", measuredCanvas = null } = {}) {
+  const language = locale === "en"
+    ? "Write all descriptions, facts, labels, limitations, and the reconstruction prompt in English. Preserve exact visible spelling."
+    : "所有描述、事实、标签、限制项和重建提示词使用简体中文；画面中的文字保留原始拼写。";
+  const measured = measuredCanvas?.width && measuredCanvas?.height
+    ? `sourceCanvasPixels=${JSON.stringify({ width: measuredCanvas.width, height: measuredCanvas.height })}; use this only to determine the visible aspect ratio and relative composition.`
+    : "sourceCanvasPixels=unavailable; infer only the visible aspect ratio and relative composition.";
+  const reconstructionChecklist = locale === "en"
+    ? "Build reconstructionPrompt from this internal ten-dimension checklist: (1) subjects and count, appearance, pose and relative scale; (2) scene, time, environment and foreground/midground/background; (3) actions, interactions and physical state; (4) visual style, medium, rendering, materials and textures; (5) framing, camera angle, lens feel, composition, focus and depth; (6) light sources, direction, contrast, palette and grading; (7) mood and narrative atmosphere; (8) visible text, typography, graphic marks and overlays; (9) aspect ratio, medium and image-quality traits; (10) reliably visible production or post-processing traits only. This checklist guides one continuous prompt; do not return ten separate sections."
+    : "用十维度在内部检查后写成一段连续的 reconstructionPrompt，不要输出十个独立分区。十维度是：主体、场景、动作、风格材质、构图镜头、光线色彩、情绪、可见文字图形、媒介画质、制作表现。具体检查：（1）主体数量、外观、姿态、朝向、相对位置与比例；（2）场景、时间环境、前景/中景/背景；（3）动作、交互与物理状态；（4）视觉风格、媒介、渲染、材质与纹理；（5）画幅、机位视角、镜头感、构图、焦点与景深；（6）光源、方向、明暗、色彩方案与调色；（7）情绪与叙事氛围；（8）可见文字、字体观感、图形标记与叠加层；（9）画幅比例、媒介与画质特征；（10）只有可靠可见时才写制作与后期表现。";
+  const completenessCheck = locale === "en"
+    ? "Before returning, check all four corners, foreground, main subject area, background, overlays, borders, and visible text. Include exact legible text and its typography or placement when useful for reconstruction. Omit uncertain or not applicable details instead of naming them as missing; especially do not invent sound, workflow, authors, brands, hidden objects, or AI probability."
+    : "返回前检查画面四角、前景、主体区、背景、叠加层、边缘和所有可见文字；对复刻有用且能辨认的文字要逐字保留，并写明字体观感与位置。不确定或不适用的内容直接省略，不要写成缺失项；尤其不要编造声音、工作流、作者、品牌、隐藏物体或 AI 概率。";
+  return [
+    "Analyze only the attached image in one single visual-analysis call.",
+    locale === "en" ? "Complete the full analysis in this single call; no second visual audit is allowed." : "必须在这一次单次分析中完成全部拆解与自检，不进行第二次视觉复审。",
+    language,
+    String(customInstruction ?? "").trim(),
+    measured,
+    "只输出 reconstructionPrompt 和 tags。",
+    reconstructionChecklist,
+    completenessCheck,
+    "reconstructionPrompt must be self-contained, detailed enough to recreate the image without seeing it, and limited to visible evidence. Preserve spatial relationships, relative scale, depth, occlusion, exact legible text, and distinctive visual traits; do not merely summarize the scene.",
+    "tags must contain one to six valid, compact, search-oriented labels from the fixed taxonomy paths; prefer the highest-value visible cues.",
+    `fixedPaths=${analysisTaxonomyPayload(catalog, locale)}`,
+    "Return exactly one JSON object matching the supplied visual-model response schema. Do not output commentary, markdown, scores, hidden reasoning, or additional fields."
+  ].filter(Boolean).join("\n");
+}
+
+export function normalizeVisualModelResponse(value, catalogValue) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("视觉模型返回格式不正确，本次没有写入");
+  }
+  const source = normalizeKnownRootFieldCasing(value);
+  const tagDiagnostics = partitionModelTags(source.tags, catalogValue);
+  if (!tagDiagnostics.accepted.length) {
+    throw new Error("视觉模型没有返回至少一个有效检索标签，本次没有写入");
+  }
+  const legacyFieldsPresent = ["description", "canvas", "elements", "dimensions", "ocr", "limitations", "completeness"]
+    .some((field) => Object.hasOwn(source, field));
+  if (!legacyFieldsPresent && Object.hasOwn(source, "reconstructionPrompt")) {
+    const reconstructionPrompt = requiredText(source.reconstructionPrompt, "视觉模型没有返回可独立使用的重建提示词");
+    return {
+      reconstructionPrompt,
+      description: reconstructionPrompt,
+      tags: tagDiagnostics.accepted,
+      version: VISUAL_ANALYSIS_VERSION,
+      quality: "complete",
+      missingFields: [],
+      normalizationDiagnostics: tagDiagnostics.rejections,
+      tagDiagnostics: { rejectedCount: tagDiagnostics.rejectedCount, rejections: tagDiagnostics.rejections }
+    };
+  }
+  const converted = {
+    ...source,
+    elements: (Array.isArray(source.elements) ? source.elements : []).map(convertModelBoxIfValid),
+    ocr: (Array.isArray(source.ocr) ? source.ocr : []).map(convertModelBoxIfValid),
+    tags: tagDiagnostics.accepted
+  };
+  try {
+    return {
+      ...normalizeVisualAnalysisV2(converted, catalogValue),
+      quality: "complete",
+      missingFields: [],
+      normalizationDiagnostics: tagDiagnostics.rejections,
+      tagDiagnostics: { rejectedCount: tagDiagnostics.rejectedCount, rejections: tagDiagnostics.rejections }
+    };
+  } catch (error) {
+    return normalizePartialVisualAnalysis(converted, catalogValue, tagDiagnostics, error);
+  }
+}
+
+export function mergePartialVisualAnalysis(previousValue, incomingValue) {
+  const previous = previousValue && typeof previousValue === "object" ? previousValue : {};
+  const incoming = incomingValue && typeof incomingValue === "object" ? incomingValue : {};
+  if (previous.quality !== "partial") return incoming;
+  const previousMissing = new Set(Array.isArray(previous.missingFields) ? previous.missingFields : []);
+  const incomingMissing = new Set(Array.isArray(incoming.missingFields) ? incoming.missingFields : []);
+  const fields = ["description", "canvas", "elements", "dimensions", "ocr", "reconstructionPrompt", "completeness"];
+  const merged = {};
+  const missingFields = [];
+  for (const field of fields) {
+    const previousValid = !previousMissing.has(field) && hasVisualField(previous, field);
+    const incomingValid = !incomingMissing.has(field) && hasVisualField(incoming, field);
+    if (previousValid) merged[field] = structuredClone(previous[field]);
+    else if (incomingValid) merged[field] = structuredClone(incoming[field]);
+    else {
+      if (hasVisualField(incoming, field)) merged[field] = structuredClone(incoming[field]);
+      else if (hasVisualField(previous, field)) merged[field] = structuredClone(previous[field]);
+      missingFields.push(field);
+    }
+  }
+  merged.limitations = [...new Set([...(previous.limitations ?? []), ...(incoming.limitations ?? [])].map(String).filter(Boolean))];
+  const tagKeys = new Set();
+  merged.tags = [...(incoming.tags ?? []), ...(previous.tags ?? [])].filter((tag) => {
+    const key = `${tag?.g ?? ""}\n${tag?.t ?? ""}`;
+    if (!tag?.g || !tag?.t || tagKeys.has(key) || tagKeys.size >= 6) return false;
+    tagKeys.add(key);
+    return true;
+  }).map((tag) => ({ g: tag.g, t: tag.t }));
+  const unresolved = new Set(missingFields);
+  merged.normalizationDiagnostics = [
+    ...(incoming.normalizationDiagnostics ?? []),
+    ...(previous.normalizationDiagnostics ?? [])
+  ].filter((item, index, all) => (item?.field === "tags" || unresolved.has(item?.field))
+    && all.findIndex((other) => other?.field === item?.field && other?.code === item?.code && other?.message === item?.message) === index);
+  merged.quality = missingFields.length ? "partial" : "complete";
+  merged.missingFields = missingFields;
+  merged.tagDiagnostics = {
+    rejectedCount: Number(previous.tagDiagnostics?.rejectedCount || 0) + Number(incoming.tagDiagnostics?.rejectedCount || 0),
+    rejections: [...(previous.tagDiagnostics?.rejections ?? []), ...(incoming.tagDiagnostics?.rejections ?? [])]
+  };
+  return merged;
+}
+
+function hasVisualField(value, field) {
+  const fieldValue = value?.[field];
+  if (Array.isArray(fieldValue)) return true;
+  if (fieldValue && typeof fieldValue === "object") return true;
+  return typeof fieldValue === "string" && Boolean(fieldValue.trim());
+}
+
+function normalizeKnownRootFieldCasing(value) {
+  const normalized = {};
+  for (const [field, fieldValue] of Object.entries(value)) {
+    const normalizedKey = field.toLocaleLowerCase("en-US").replace(/[\s-]+/g, "_");
+    const canonical = ROOT_FIELD_ALIASES.get(normalizedKey) || ROOT_FIELDS_BY_CASE.get(normalizedKey);
+    if (!canonical) continue;
+    if (Object.hasOwn(normalized, canonical)) {
+      throw new Error(`视觉分析字段大小写冲突：${canonical}`);
+    }
+    normalized[canonical] = fieldValue;
+  }
+  return normalized;
+}
+
+function normalizePartialVisualAnalysis(value, catalogValue, tagDiagnostics, fullError) {
+  const missingFields = [];
+  const normalizationDiagnostics = [];
+  const result = {};
+  const record = (field, normalize) => {
+    try {
+      const normalized = normalize();
+      if (normalized === undefined || normalized === null || normalized === "") throw new Error(`${field} 为空`);
+      result[field] = normalized;
+    } catch (error) {
+      missingFields.push(field);
+      normalizationDiagnostics.push({ field, message: String(error?.message || `${field} 无效`) });
+    }
+  };
+  record("description", () => requiredText(value.description, "视觉模型没有返回画面描述"));
+  record("canvas", () => normalizeCanvas(value.canvas));
+  record("elements", () => normalizePartialElements(value.elements));
+  record("dimensions", () => normalizePartialDimensions(value.dimensions));
+  record("ocr", () => normalizePartialOcr(value.ocr));
+  record("reconstructionPrompt", () => requiredText(value.reconstructionPrompt, "视觉模型没有返回可独立使用的重建提示词"));
+  record("completeness", () => normalizeCompleteness(value.completeness));
+  result.limitations = cleanStrings(value.limitations);
+  result.tags = validateAnalysisTagResponse({ tags: tagDiagnostics.accepted }, catalogValue, { allowEmpty: true, maxTags: 6 });
+  normalizationDiagnostics.push(...tagDiagnostics.rejections);
+  if (!result.description && !result.reconstructionPrompt) throw fullError;
+  if (!result.description) result.description = result.reconstructionPrompt;
+  return {
+    ...result,
+    quality: "partial",
+    missingFields,
+    normalizationDiagnostics,
+    tagDiagnostics: { rejectedCount: tagDiagnostics.rejectedCount, rejections: tagDiagnostics.rejections }
+  };
+}
+
+function normalizePartialElements(values) {
+  const normalized = (Array.isArray(values) ? values : []).flatMap((item) => {
+    try { return [normalizeElements([convertModelBoxIfValid(item)])[0]]; }
+    catch { return []; }
+  });
+  if (!normalized.length) throw new Error("视觉分析没有可用的画面元素");
+  return normalized;
+}
+
+function normalizePartialDimensions(values) {
+  const byId = new Map((Array.isArray(values) ? values : []).map((item) => [String(item?.id ?? "").trim(), item]));
+  const normalized = VISUAL_ANALYSIS_DIMENSIONS.flatMap((id) => {
+    const item = byId.get(id);
+    if (!item || typeof item.applicable !== "boolean") return [];
+    const facts = cleanStrings(item.facts);
+    if (!item.applicable && facts.length) return [];
+    return [{ id, applicable: item.applicable, facts, measurements: cleanStrings(item.measurements) }];
+  });
+  if (!normalized.length) throw new Error("视觉分析没有可用的视觉维度");
+  return normalized;
+}
+
+function normalizePartialOcr(values) {
+  if (!Array.isArray(values)) throw new Error("视觉分析缺少 OCR 清单");
+  return values.flatMap((item) => {
+    try { return [normalizeOcr([convertModelBoxIfValid(item)])[0]]; }
+    catch { return []; }
+  });
+}
+
+export function normalizeVisualAnalysisV2(value, catalogValue) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("视觉模型返回格式不正确，本次没有写入");
+  }
+  assertOnlyFields(value, ROOT_FIELDS, "视觉分析");
+  const description = requiredText(value.description, "视觉模型没有返回画面描述，本次没有写入");
+  const canvas = normalizeCanvas(value.canvas);
+  const elements = normalizeElements(value.elements);
+  const dimensions = normalizeDimensions(value.dimensions);
+  const ocr = normalizeOcr(value.ocr);
+  const reconstructionPrompt = requiredText(value.reconstructionPrompt, "视觉模型没有返回可独立使用的重建提示词");
+  const completeness = normalizeCompleteness(value.completeness);
+  return {
+    description,
+    canvas,
+    elements,
+    dimensions,
+    ocr,
+    reconstructionPrompt,
+    limitations: cleanStrings(value.limitations),
+    completeness,
+    tags: validateAnalysisTagResponse({ tags: value.tags }, catalogValue, { allowEmpty: true, maxTags: 6 })
+  };
+}
+
+export function prepareVisualSetSummary(values, locale = "zh-CN") {
+  const assets = [];
+  const missingAssetIds = [];
+  for (const item of Array.isArray(values) ? values : []) {
+    const assetId = String(item?.assetId ?? "").trim();
+    if (!assetId) continue;
+    if (!item?.analysis || item.analysis.quality === "partial" || Number(item.analysis.version ?? VISUAL_ANALYSIS_VERSION) !== VISUAL_ANALYSIS_VERSION) {
+      missingAssetIds.push(assetId);
+      continue;
+    }
+    const currentFingerprint = String(item?.imageFingerprint ?? "").trim();
+    const analysisFingerprint = String(item?.analysis?.imageFingerprint ?? "").trim();
+    if (!currentFingerprint || !analysisFingerprint || currentFingerprint !== analysisFingerprint) {
+      missingAssetIds.push(assetId);
+      continue;
+    }
+    const reconstructionPrompt = String(item.analysis.reconstructionPrompt ?? "").trim();
+    const tags = (Array.isArray(item.analysis.tags) ? item.analysis.tags : []).flatMap((tag) => {
+      const g = String(tag?.g ?? "").trim();
+      const t = String(tag?.t ?? "").trim();
+      return g && t ? [{ g, t }] : [];
+    }).slice(0, 6);
+    if (!reconstructionPrompt || !tags.length) {
+      missingAssetIds.push(assetId);
+      continue;
+    }
+    assets.push({ assetId, reconstructionPrompt, tags });
+  }
+  return {
+    ready: missingAssetIds.length === 0 && assets.length > 0,
+    missingAssetIds,
+    input: missingAssetIds.length || !assets.length ? null : {
+      locale: locale === "en" ? "en" : "zh-CN",
+      assets
+    }
+  };
+}
+
+export function compileVisualSetSummaryInstruction(locale = "zh-CN") {
+  return locale === "en"
+    ? "Summarize only the saved per-image reconstruction prompts and search tags as one creative set. Do not request or infer from source images. Return strict JSON with imageRoles, sharedVisualSystem, differences, continuity, compositionRules, and reusablePrompt. Cover every assetId exactly once in imageRoles."
+    : "仅汇总已保存的逐图反推提示词与检索标签，不请求原图，也不把主图或拼图当作缺失图片的替代。严格返回 JSON：imageRoles（每个 assetId 恰好一次）、sharedVisualSystem（共同视觉系统）、differences（差异）、continuity（连续关系）、compositionRules（组合规律）、reusablePrompt（不依赖原图的可复用创作提示词）。";
+}
+
+export function normalizeVisualSetSummaryV1(value, assetIds = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("整组总结返回格式无效");
+  const expected = [...new Set(assetIds.map((id) => String(id ?? "").trim()).filter(Boolean))];
+  const imageRoles = (Array.isArray(value.imageRoles) ? value.imageRoles : []).map((item) => ({
+    assetId: requiredText(item?.assetId, "整组总结缺少素材编号"),
+    role: requiredText(item?.role, "整组总结缺少逐图角色")
+  }));
+  if (imageRoles.length !== expected.length || expected.some((id) => !imageRoles.some((item) => item.assetId === id))) {
+    throw new Error("整组总结没有覆盖全部逐图分析");
+  }
+  return {
+    version: VISUAL_SET_SUMMARY_VERSION,
+    imageRoles,
+    sharedVisualSystem: cleanStrings(value.sharedVisualSystem),
+    differences: cleanStrings(value.differences),
+    continuity: cleanStrings(value.continuity),
+    compositionRules: cleanStrings(value.compositionRules),
+    reusablePrompt: requiredText(value.reusablePrompt, "整组总结缺少可复用创作提示词")
+  };
+}
+
+function visualAnalysisPayload(value = {}) {
+  return Object.fromEntries([...ROOT_FIELDS].map((key) => [key, key === "tags" && !Array.isArray(value[key]) ? [] : value[key]]));
+}
+
+function normalizeCanvas(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("视觉分析缺少画布信息");
+  const width = positiveInteger(value.width);
+  const height = positiveInteger(value.height);
+  const aspectRatio = requiredText(value.aspectRatio, "视觉分析缺少画布比例");
+  const orientation = ORIENTATIONS.includes(value.orientation) ? value.orientation : "";
+  if (!width || !height || !orientation) throw new Error("视觉分析画布信息不完整");
+  const dominantColors = (Array.isArray(value.dominantColors) ? value.dominantColors : []).map((item) => {
+    const hex = String(item?.hex ?? "").trim().toUpperCase();
+    const coveragePercent = boundedNumber(item?.coveragePercent, 0, 100, "主色覆盖率");
+    const source = measurementSource(item?.source);
+    if (!/^#[0-9A-F]{6}$/.test(hex)) throw new Error("视觉分析主色格式无效");
+    return { hex, coveragePercent, source };
+  });
+  if (dominantColors.length > 12) throw new Error("视觉分析主色数量过多");
+  return { width, height, aspectRatio, orientation, dominantColors };
+}
+
+function normalizeElements(values) {
+  if (!Array.isArray(values) || !values.length) throw new Error("视觉分析没有返回画面元素清单");
+  const seen = new Set();
+  return values.map((item) => {
+    const id = requiredText(item?.id, "画面元素缺少编号");
+    if (seen.has(id)) throw new Error("画面元素编号重复");
+    seen.add(id);
+    return {
+      id,
+      label: requiredText(item?.label, "画面元素缺少名称"),
+      category: requiredText(item?.category, "画面元素缺少类别"),
+      bbox: normalizeBbox(item?.bbox),
+      coveragePercent: boundedNumber(item?.coveragePercent, 0, 100, "画面元素覆盖率"),
+      depthLayer: DEPTH_LAYERS.includes(item?.depthLayer) ? item.depthLayer : invalid("画面元素景深层级无效"),
+      occludes: cleanStrings(item?.occludes),
+      occludedBy: cleanStrings(item?.occludedBy),
+      relationships: cleanStrings(item?.relationships),
+      visualAttributes: cleanStrings(item?.visualAttributes)
+    };
+  });
+}
+
+function normalizeDimensions(values) {
+  if (!Array.isArray(values) || values.length !== VISUAL_ANALYSIS_DIMENSIONS.length) {
+    throw new Error("视觉分析必须完整返回十个视觉维度");
+  }
+  const byId = new Map(values.map((item) => [String(item?.id ?? "").trim(), item]));
+  if (byId.size !== VISUAL_ANALYSIS_DIMENSIONS.length || VISUAL_ANALYSIS_DIMENSIONS.some((id) => !byId.has(id))) {
+    throw new Error("视觉分析必须完整返回十个视觉维度");
+  }
+  return VISUAL_ANALYSIS_DIMENSIONS.map((id) => {
+    const item = byId.get(id);
+    const applicable = item?.applicable === true;
+    const facts = cleanStrings(item?.facts);
+    if (!applicable && facts.length) throw new Error(`${id} 标记为不适用时不能编造事实`);
+    return { id, applicable, facts, measurements: cleanStrings(item?.measurements) };
+  });
+}
+
+function normalizeOcr(values) {
+  if (!Array.isArray(values)) throw new Error("视觉分析缺少 OCR 清单");
+  return values.map((item) => ({
+    text: String(item?.text ?? "").trim(),
+    legibility: OCR_LEGIBILITY.includes(item?.legibility) ? item.legibility : invalid("OCR 可读性状态无效"),
+    bbox: normalizeBbox(item?.bbox),
+    typography: cleanStrings(item?.typography)
+  }));
+}
+
+function normalizeCompleteness(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("视觉分析缺少完整性检查");
+  const checkedRegions = cleanStrings(value.checkedRegions);
+  if (!checkedRegions.length) throw new Error("视觉分析没有完成画面区域检查");
+  return { checkedRegions, omittedVisibleElements: cleanStrings(value.omittedVisibleElements) };
+}
+
+function normalizeBbox(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("视觉分析边界框无效");
+  const x = boundedNumber(value.x, 0, 1000, "边界框 x");
+  const y = boundedNumber(value.y, 0, 1000, "边界框 y");
+  const width = boundedNumber(value.width, 0, 1000, "边界框宽度");
+  const height = boundedNumber(value.height, 0, 1000, "边界框高度");
+  if (x + width > 1000 || y + height > 1000) throw new Error("视觉分析边界框超出画面");
+  return { x, y, width, height, source: measurementSource(value.source) };
+}
+
+function fixedTagGroupIds(catalog) {
+  const payload = JSON.parse(analysisTaxonomyPayload(catalog));
+  return payload.f.flatMap((facet) => facet[2].map((group) => group[0]));
+}
+
+function partitionModelTags(values, catalog) {
+  const source = Array.isArray(values) ? values : [];
+  const accepted = [];
+  const seen = new Set();
+  let rejectedCount = Array.isArray(values) ? 0 : 1;
+  const rejections = Array.isArray(values) ? [] : [{ field: "tags", code: "invalid_collection", count: 1 }];
+  for (const value of source) {
+    let tag;
+    try {
+      const diagnostics = [];
+      [tag] = validateAnalysisTagResponse({ tags: [value] }, catalog, { allowEmpty: true, maxTags: 1, diagnostics });
+      rejections.push(...diagnostics);
+    } catch {
+      rejectedCount += 1;
+      rejections.push({ field: "tags", code: "invalid_or_unknown_tag_dropped", count: 1 });
+      continue;
+    }
+    const key = JSON.stringify(tag);
+    if (seen.has(key) || accepted.length >= 6) {
+      rejectedCount += 1;
+      rejections.push({ field: "tags", code: seen.has(key) ? "duplicate_dropped" : "over_limit_dropped", count: 1 });
+      continue;
+    }
+    seen.add(key);
+    accepted.push(tag);
+  }
+  return { accepted, rejectedCount, rejections };
+}
+
+function convertModelBox(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+  const box = item.box_2d;
+  if (!Array.isArray(box) || box.length !== 4) {
+    throw new Error("视觉模型没有完整返回画面位置，本次没有写入");
+  }
+  const [yMin, xMin, yMax, xMax] = box.map(Number);
+  if (![yMin, xMin, yMax, xMax].every((value) => Number.isInteger(value) && value >= 0 && value <= 1000)
+      || yMin >= yMax || xMin >= xMax) {
+    throw new Error("视觉模型返回的画面位置关系不完整，本次没有写入");
+  }
+  const { box_2d: _box, ...rest } = item;
+  return {
+    ...rest,
+    bbox: {
+      x: xMin,
+      y: yMin,
+      width: xMax - xMin,
+      height: yMax - yMin,
+      source: "estimated"
+    }
+  };
+}
+
+function convertModelBoxIfValid(item) {
+  try { return convertModelBox(item); }
+  catch { return item; }
+}
+
+function assertOnlyFields(value, allowed, label) {
+  const unexpected = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unexpected.length) throw new Error(`${label}包含未允许字段：${unexpected.join("、")}`);
+}
+
+function measurementSource(value) {
+  if (!MEASUREMENT_SOURCES.includes(value)) throw new Error("视觉分析测量来源无效");
+  return value;
+}
+
+function positiveInteger(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : 0;
+}
+
+function boundedNumber(value, minimum, maximum, label) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < minimum || number > maximum) throw new Error(`${label}无效`);
+  return number;
+}
+
+function requiredText(value, message) {
+  const text = String(value ?? "").trim();
+  if (!text) throw new Error(message);
+  return text;
+}
+
+function cleanStrings(values) {
+  return [...new Set((Array.isArray(values) ? values : []).map((item) => String(item ?? "").trim()).filter(Boolean))];
+}
+
+function invalid(message) {
+  throw new Error(message);
+}
